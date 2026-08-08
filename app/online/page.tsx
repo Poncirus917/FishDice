@@ -3,11 +3,6 @@ import { useState, useEffect, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import toast from 'react-hot-toast';
 import { supabase } from '../lib/supabase';
-import Sidebar from '../components/Sidebar';
-import ImportView from './modules/ImportView';
-import ConsoleView from './modules/ConsoleView';
-import CharacterManager from './modules/CharacterManager';
-import { CharacterState } from '../(single)/page';
 
 export default function OnlinePage() {
   const router = useRouter();
@@ -19,10 +14,6 @@ export default function OnlinePage() {
   const [roomCode, setRoomCode] = useState('');
   const [joinCode, setJoinCode] = useState('');
   const [isKP, setIsKP] = useState(false);
-
-  // 内容状态（与单机版一致）
-  const [activeTab, setActiveTab] = useState<'import' | 'console'>('import');
-  const [characters, setCharacters] = useState<CharacterState[]>([]);
 
   // 个人信息
   const [displayName, setDisplayName] = useState('');
@@ -87,18 +78,12 @@ export default function OnlinePage() {
     setView('lobby');
     setRoomCode('');
     setJoinCode('');
-    setCharacters([]);
-    setActiveTab('import');
   };
 
   // 退出登录
   const handleLogout = async () => {
     await supabase.auth.signOut();
     router.push('/online/auth');
-  };
-
-  const handleAddCharacter = (newChar: CharacterState) => {
-    setCharacters(prev => [...prev, newChar]);
   };
 
   // 打开个人信息弹窗
@@ -310,93 +295,29 @@ export default function OnlinePage() {
     );
   }
 
-  // ===================== 角色管理视图 =====================
-  if (view === 'characters') {
-    return (
-      <div className="min-h-screen bg-slate-50 text-black font-sans">
-        <header className="flex justify-between items-center px-6 py-4 bg-white border-b border-slate-200 shadow-sm sticky top-0 z-10">
-          <div className="flex items-center gap-4">
-            <button
-              onClick={() => setView('lobby')}
-              className="text-slate-400 hover:text-cyan-600 text-sm font-bold transition"
-            >
-              ← 返回大厅
-            </button>
-            <div className="h-4 w-px bg-slate-200" />
-            <span className="font-bold text-lg">📚 角色管理</span>
-          </div>
-          <UserBadge />
-        </header>
-
-        <div className="max-w-6xl mx-auto p-4">
-          <CharacterManager userId={userId!} />
+  // ===================== 开发中占位视图 =====================
+  const DevelopingView = ({ title, onBack }: { title: string; onBack: () => void }) => (
+    <div className="min-h-screen bg-slate-50 text-black font-sans">
+      <header className="flex justify-between items-center px-6 py-4 bg-white border-b border-slate-200 shadow-sm sticky top-0 z-10">
+        <div className="flex items-center gap-4">
+          <button
+            onClick={onBack}
+            className="text-slate-400 hover:text-cyan-600 text-sm font-bold transition"
+          >
+            ← 返回大厅
+          </button>
+          <div className="h-4 w-px bg-slate-200" />
+          <span className="font-bold text-lg">{title}</span>
         </div>
-
-        {showProfile && (
-          <ProfileModal
-            editName={editName}
-            setEditName={setEditName}
-            editAvatarPreview={editAvatarPreview}
-            handleAvatarChange={handleAvatarChange}
-            fileInputRef={fileInputRef}
-            handleSave={handleSaveProfile}
-            handleClose={() => setShowProfile(false)}
-            handleLogout={handleLogout}
-            saving={savingProfile}
-          />
-        )}
+        <UserBadge />
+      </header>
+      <div className="flex-1 flex items-center justify-center p-4">
+        <div className="text-center">
+          <div className="text-6xl mb-4">🔧</div>
+          <h2 className="text-2xl font-bold text-slate-700 mb-2">开发中</h2>
+          <p className="text-slate-400">此功能正在紧锣密鼓地开发中，敬请期待。</p>
+        </div>
       </div>
-    );
-  }
-
-  // ===================== 房间视图 =====================
-  return (
-    <div className="flex h-screen w-full bg-slate-50 text-black font-sans overflow-hidden">
-      <Sidebar activeTab={activeTab} onTabChange={setActiveTab} />
-
-      <main className="flex-1 flex flex-col min-w-0 overflow-hidden">
-        <div className="flex items-center justify-between px-6 py-3 bg-white border-b border-slate-200 shadow-sm flex-shrink-0">
-          <div className="flex items-center gap-4">
-            <div className="flex items-center gap-2">
-              <span className="text-[10px] text-slate-400 font-black uppercase tracking-widest">Room</span>
-              <span className="text-lg font-black text-cyan-600 tracking-widest">{roomCode}</span>
-            </div>
-            <div className="h-4 w-px bg-slate-200" />
-            <span className={`text-xs px-2 py-1 rounded-md font-bold ${isKP ? 'bg-slate-900 text-white' : 'bg-blue-100 text-blue-600'}`}>
-              {isKP ? 'KP 守秘人' : 'PL 玩家'}
-            </span>
-            <span className="text-xs text-slate-300 hidden sm:block">在线: 1人</span>
-          </div>
-
-          <div className="flex items-center gap-3">
-            <UserBadge />
-            <button
-              onClick={handleLeaveRoom}
-              className="px-3 py-1.5 text-xs font-bold text-slate-500 hover:text-red-500 hover:bg-red-50 rounded-lg transition"
-            >
-              离开房间
-            </button>
-          </div>
-        </div>
-
-        <div className="flex-1 overflow-y-auto custom-scrollbar">
-          <div className="w-full h-full p-4">
-            {activeTab === 'import' && (
-              <div className="max-w-6xl mx-auto">
-                <ImportView
-                  onConfirm={handleAddCharacter}
-                  characters={characters}
-                  setCharacters={setCharacters}
-                />
-              </div>
-            )}
-            {activeTab === 'console' && (
-              <ConsoleView characters={characters} setCharacters={setCharacters} />
-            )}
-          </div>
-        </div>
-      </main>
-
       {showProfile && (
         <ProfileModal
           editName={editName}
@@ -412,6 +333,16 @@ export default function OnlinePage() {
       )}
     </div>
   );
+
+  // ===================== 角色管理视图 =====================
+  if (view === 'characters') {
+    return <DevelopingView title="📚 角色管理" onBack={() => setView('lobby')} />;
+  }
+
+  // ===================== 房间视图 =====================
+  if (view === 'room') {
+    return <DevelopingView title={`🎭 房间 ${roomCode}`} onBack={handleLeaveRoom} />;
+  }
 }
 
 // ===================== 个人信息弹窗组件 =====================

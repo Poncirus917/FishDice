@@ -25,6 +25,7 @@ export default function Home() {
   const [activeTab, setActiveTab] = useState<'import' | 'console'>('import');
   const [characters, setCharacters] = useState<CharacterState[]>([]);
   const [isInitialized, setIsInitialized] = useState(false);
+  const [redirecting, setRedirecting] = useState(true);
 
   useEffect(() => {
     const host = typeof window !== 'undefined' ? window.location.hostname : '';
@@ -34,16 +35,17 @@ export default function Home() {
       host.includes('online');
     if (isOnlineDeploy) {
       window.location.replace('/online/auth');
+    } else {
+      setRedirecting(false);
     }
   }, []);
 
-  if (typeof window !== 'undefined') {
-    const host = window.location.hostname;
-    const isOnlineDeploy =
-      process.env.NEXT_PUBLIC_APP_MODE === 'online' ||
-      host.includes('fish-dice-online') ||
-      host.includes('online');
-    if (isOnlineDeploy) return null;
+  if (redirecting) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-slate-900">
+        <div className="text-cyan-400 animate-pulse text-sm tracking-widest">LOADING...</div>
+      </div>
+    );
   }
 
   // --- 持久化逻辑 ---
