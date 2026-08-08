@@ -208,6 +208,9 @@ export default function OnlinePage() {
             <span className="text-2xl">🐟</span>
             <span className="font-bold text-lg">鱼骰 <span className="text-cyan-400 text-xs font-normal">联机版</span></span>
           </div>
+          <div className="flex items-center gap-4">
+            <UserBadge dark />
+          </div>
         </header>
 
         <div className="flex-1 flex items-center justify-center p-4">
