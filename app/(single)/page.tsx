@@ -27,13 +27,23 @@ export default function Home() {
   const [isInitialized, setIsInitialized] = useState(false);
 
   useEffect(() => {
-    if (process.env.NEXT_PUBLIC_APP_MODE === 'online') {
+    const host = typeof window !== 'undefined' ? window.location.hostname : '';
+    const isOnlineDeploy =
+      process.env.NEXT_PUBLIC_APP_MODE === 'online' ||
+      host.includes('fish-dice-online') ||
+      host.includes('online');
+    if (isOnlineDeploy) {
       window.location.replace('/online/auth');
     }
   }, []);
 
-  if (process.env.NEXT_PUBLIC_APP_MODE === 'online') {
-    return null;
+  if (typeof window !== 'undefined') {
+    const host = window.location.hostname;
+    const isOnlineDeploy =
+      process.env.NEXT_PUBLIC_APP_MODE === 'online' ||
+      host.includes('fish-dice-online') ||
+      host.includes('online');
+    if (isOnlineDeploy) return null;
   }
 
   // --- 持久化逻辑 ---
