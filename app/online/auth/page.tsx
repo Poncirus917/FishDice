@@ -30,16 +30,17 @@ export default function AuthPage() {
     }
   }, [countdown]);
 
-  // 注册模式下：邮箱失焦时查是否已注册
-  const checkEmailExists = async () => {
+  // 注册模式下：检测邮箱是否已注册
+  const checkEmailExists = async (targetEmail?: string) => {
     if (mode !== 'register') return;
-    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return;
+    const emailToCheck = (targetEmail ?? email).trim().toLowerCase();
+    if (!emailToCheck || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailToCheck)) return;
     setCheckingEmail(true);
     try {
       const { count, error } = await supabase
         .from('profiles')
         .select('email', { count: 'exact', head: true })
-        .eq('email', email.trim().toLowerCase());
+        .eq('email', emailToCheck);
       if (!error) {
         setEmailExists((count ?? 0) > 0);
       }
@@ -48,9 +49,15 @@ export default function AuthPage() {
     }
   };
 
-  // 邮箱变更时清除已存在标记
+  // 邮箱变更时：防抖 500ms 自动检测（不输完也会检测）
   useEffect(() => {
     setEmailExists(false);
+    if (mode !== 'register') return;
+    const trimmed = email.trim().toLowerCase();
+    if (!trimmed || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed)) return;
+    const timer = setTimeout(() => checkEmailExists(trimmed), 500);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [email, mode]);
 
   // 登录
