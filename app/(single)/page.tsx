@@ -26,6 +26,16 @@ export default function Home() {
   const [characters, setCharacters] = useState<CharacterState[]>([]);
   const [isInitialized, setIsInitialized] = useState(false);
 
+  useEffect(() => {
+    if (process.env.NEXT_PUBLIC_APP_MODE === 'online') {
+      window.location.replace('/online/auth');
+    }
+  }, []);
+
+  if (process.env.NEXT_PUBLIC_APP_MODE === 'online') {
+    return null;
+  }
+
   // --- 持久化逻辑 ---
   useEffect(() => {
     const saved = localStorage.getItem('fish-dice-kp-vault');
