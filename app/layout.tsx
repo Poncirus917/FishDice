@@ -26,6 +26,26 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="zh-CN">
+      <head>
+        <script
+          dangerouslySetInnerHTML={{
+            __html: `
+              (function(){
+                try {
+                  var host = window.location.hostname || '';
+                  var isOnline =
+                    /fish-dice-online/i.test(host) ||
+                    /online/i.test(host);
+                  if (isOnline && window.location.pathname === '/') {
+                    window.location.replace('/online/auth');
+                    document.documentElement.style.display = 'none';
+                  }
+                } catch (e) {}
+              })();
+            `,
+          }}
+        />
+      </head>
       <body
         className={`${geistSans.variable} ${geistMono.variable} antialiased`}
       >
