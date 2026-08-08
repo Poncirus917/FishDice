@@ -234,7 +234,7 @@ export default function OnlinePage() {
             <div className="text-center">
               <h1 className="text-3xl font-bold mb-2">调查员大厅</h1>
               <p className="text-slate-500 text-xl">调查员{displayName}已接入系统。</p>
-              <p className="text-slate-500 text-xl">系统功能仍在缓慢开发中，敬请期待。</p>
+              <p className="text-slate-500 text-xl">系统功能仍在开发中，敬请期待。</p>
             </div>
 
             {/* 角色管理 */}
