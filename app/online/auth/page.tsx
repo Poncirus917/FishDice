@@ -250,7 +250,7 @@ export default function AuthPage() {
                 type="email"
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
-                onBlur={checkEmailExists}
+                onBlur={() => checkEmailExists()}
                 className={`w-full p-3 rounded-xl bg-slate-900 border transition-all outline-none focus:ring-1 ${
                   emailExists
                     ? 'border-red-500 focus:border-red-500 focus:ring-red-500'
