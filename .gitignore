@@ -2,6 +2,7 @@
 
 # dependencies
 /node_modules
+server/node_modules/
 /.pnp
 .pnp.*
 .yarn/*
@@ -39,3 +40,10 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# 项目文档（不公开）
+跑团助手：COC跑团的协助.md
+前端样式参考手册.md
+
+# server 构建产物
+server/dist/

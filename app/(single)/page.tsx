@@ -1,8 +1,8 @@
 "use client";
 import { useState, useEffect } from 'react';
 import Sidebar from '../components/Sidebar';
-import ImportView from '../views/ImportView';
-import ConsoleView from '../views/ConsoleView';
+import ImportView from './views/ImportView';
+import ConsoleView from './views/ConsoleView';
 
 // 1. 修改接口定义
 export interface CharacterState {
