@@ -18,6 +18,8 @@ export default function AuthPage() {
   const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
   const [countdown, setCountdown] = useState(0);
+  const [emailExists, setEmailExists] = useState(false);
+  const [checkingEmail, setCheckingEmail] = useState(false);
   const router = useRouter();
 
   // 倒计时
@@ -27,6 +29,29 @@ export default function AuthPage() {
       return () => clearTimeout(timer);
     }
   }, [countdown]);
+
+  // 注册模式下：邮箱失焦时查是否已注册
+  const checkEmailExists = async () => {
+    if (mode !== 'register') return;
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return;
+    setCheckingEmail(true);
+    try {
+      const { count, error } = await supabase
+        .from('profiles')
+        .select('email', { count: 'exact', head: true })
+        .eq('email', email.trim().toLowerCase());
+      if (!error) {
+        setEmailExists((count ?? 0) > 0);
+      }
+    } finally {
+      setCheckingEmail(false);
+    }
+  };
+
+  // 邮箱变更时清除已存在标记
+  useEffect(() => {
+    setEmailExists(false);
+  }, [email, mode]);
 
   // 登录
   const handleLogin = async (e: React.FormEvent) => {
@@ -45,6 +70,10 @@ export default function AuthPage() {
   // 注册 → 发送验证码
   const handleRegister = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (emailExists) {
+      toast.error('该邮箱已注册，请返回登录');
+      return;
+    }
     setLoading(true);
     const { data, error } = await supabase.auth.signUp({
       email,
@@ -56,12 +85,15 @@ export default function AuthPage() {
       toast.error(error.message);
       return;
     }
+    if (data.user && (!data.user.identities || data.user.identities.length === 0)) {
+      setEmailExists(true);
+      toast.error('该邮箱已注册，请返回登录');
+      return;
+    }
     if (data.session) {
-      // 部分配置下直接登录成功
       toast.success('注册成功！');
       router.push('/online');
     } else {
-      // 需要验证码验证
       toast.success('验证码已发送至邮箱');
       setMode('verify');
       setCountdown(60);
@@ -211,10 +243,21 @@ export default function AuthPage() {
                 type="email"
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
-                className="w-full p-3 rounded-xl bg-slate-900 border border-slate-700 focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 outline-none transition-all"
+                onBlur={checkEmailExists}
+                className={`w-full p-3 rounded-xl bg-slate-900 border transition-all outline-none focus:ring-1 ${
+                  emailExists
+                    ? 'border-red-500 focus:border-red-500 focus:ring-red-500'
+                    : 'border-slate-700 focus:border-cyan-500 focus:ring-cyan-500'
+                }`}
                 placeholder="your@email.com"
                 required
               />
+              {mode === 'register' && checkingEmail && (
+                <p className="mt-1.5 text-xs text-slate-500">正在检查邮箱...</p>
+              )}
+              {mode === 'register' && emailExists && (
+                <p className="mt-1.5 text-xs text-red-400">该邮箱已注册，请返回登录</p>
+              )}
             </div>
           )}
 
@@ -341,7 +384,7 @@ export default function AuthPage() {
 
           <button
             type="submit"
-            disabled={loading}
+            disabled={loading || (mode === 'register' && emailExists) || checkingEmail}
             className="w-full py-3.5 mt-2 bg-cyan-600 hover:bg-cyan-500 active:scale-[0.98] disabled:opacity-50 rounded-xl font-bold transition-all shadow-lg shadow-cyan-900/30"
           >
             {submitText}
