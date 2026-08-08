@@ -2,7 +2,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import toast from 'react-hot-toast';
-import { API_BASE } from '../lib/apiConfig';
+import { supabase } from '../lib/supabase';
 import Sidebar from '../components/Sidebar';
 import ImportView from './modules/ImportView';
 import ConsoleView from './modules/ConsoleView';
@@ -11,8 +11,7 @@ import { CharacterState } from '../(single)/page';
 
 export default function OnlinePage() {
   const router = useRouter();
-  const [user, setUser] = useState<string | null>(null);
-  const [email, setEmail] = useState<string | null>(null);
+  const [userId, setUserId] = useState<string | null>(null);
   const [checking, setChecking] = useState(true);
 
   // 房间状态
@@ -25,37 +24,41 @@ export default function OnlinePage() {
   const [activeTab, setActiveTab] = useState<'import' | 'console'>('import');
   const [characters, setCharacters] = useState<CharacterState[]>([]);
 
-  // 个人信息弹窗
+  // 个人信息
+  const [displayName, setDisplayName] = useState('');
+  const [avatarUrl, setAvatarUrl] = useState('');
   const [showProfile, setShowProfile] = useState(false);
-  const [profileData, setProfileData] = useState({ displayName: '', avatar: '' });
   const [editName, setEditName] = useState('');
-  const [editAvatar, setEditAvatar] = useState('');
+  const [editAvatarFile, setEditAvatarFile] = useState<File | null>(null);
+  const [editAvatarPreview, setEditAvatarPreview] = useState('');
   const [savingProfile, setSavingProfile] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // 登录检查 + 加载个人信息
   useEffect(() => {
-    const savedUser = localStorage.getItem('fish_user');
-    const savedEmail = localStorage.getItem('fish_email');
-    if (!savedUser || !savedEmail) {
-      router.push('/online/auth');
-      return;
-    }
-    setUser(savedUser);
-    setEmail(savedEmail);
-    setChecking(false);
+    supabase.auth.getSession().then(async ({ data: { session } }) => {
+      if (!session) {
+        router.push('/online/auth');
+        return;
+      }
+      const uid = session.user.id;
+      setUserId(uid);
 
-    // 拉取个人信息
-    fetch(`${API_BASE}/api/profile?username=${encodeURIComponent(savedEmail)}`)
-      .then(res => res.json())
-      .then(data => {
-        if (data.displayName) {
-          setProfileData({ displayName: data.displayName, avatar: data.avatar || '' });
-          setUser(data.displayName);
-          localStorage.setItem('fish_user', data.displayName);
-        }
-      })
-      .catch(() => {});
+      // 拉取 profile
+      const { data: profile } = await supabase
+        .from('profiles')
+        .select('display_name, avatar_url')
+        .eq('id', uid)
+        .single();
+
+      if (profile) {
+        setDisplayName(profile.display_name || session.user.email || '调查员');
+        setAvatarUrl(profile.avatar_url || '');
+      } else {
+        setDisplayName(session.user.email || '调查员');
+      }
+      setChecking(false);
+    });
   }, [router]);
 
   // 创建房间
@@ -89,9 +92,8 @@ export default function OnlinePage() {
   };
 
   // 退出登录
-  const handleLogout = () => {
-    localStorage.removeItem('fish_user');
-    localStorage.removeItem('fish_email');
+  const handleLogout = async () => {
+    await supabase.auth.signOut();
     router.push('/online/auth');
   };
 
@@ -101,12 +103,13 @@ export default function OnlinePage() {
 
   // 打开个人信息弹窗
   const handleOpenProfile = () => {
-    setEditName(profileData.displayName);
-    setEditAvatar(profileData.avatar);
+    setEditName(displayName);
+    setEditAvatarPreview(avatarUrl);
+    setEditAvatarFile(null);
     setShowProfile(true);
   };
 
-  // 头像上传处理
+  // 头像上传处理（本地预览）
   const handleAvatarChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -114,8 +117,9 @@ export default function OnlinePage() {
       toast.error("头像图片不能超过2MB");
       return;
     }
+    setEditAvatarFile(file);
     const reader = new FileReader();
-    reader.onload = () => setEditAvatar(reader.result as string);
+    reader.onload = () => setEditAvatarPreview(reader.result as string);
     reader.readAsDataURL(file);
   };
 
@@ -125,29 +129,57 @@ export default function OnlinePage() {
       toast.error("用户名不能为空");
       return;
     }
+    if (!userId) return;
     setSavingProfile(true);
     try {
-      const res = await fetch(`${API_BASE}/api/profile`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          username: email,
-          displayName: editName.trim(),
-          avatar: editAvatar,
-        }),
-      });
-      const data = await res.json();
-      if (res.ok) {
-        setProfileData({ displayName: data.displayName, avatar: data.avatar });
-        setUser(data.displayName);
-        localStorage.setItem('fish_user', data.displayName);
-        toast.success("个人信息已更新");
-        setShowProfile(false);
-      } else {
-        toast.error(data.message || "更新失败");
+      // 更新用户名
+      const { error: nameError } = await supabase
+        .from('profiles')
+        .update({ display_name: editName.trim() })
+        .eq('id', userId);
+
+      if (nameError) {
+        if (nameError.message.includes('duplicate')) {
+          toast.error("该用户名已被使用");
+        } else {
+          toast.error(nameError.message);
+        }
+        setSavingProfile(false);
+        return;
       }
+
+      // 如果选了新头像，上传到 Storage
+      if (editAvatarFile) {
+        const fileExt = editAvatarFile.name.split('.').pop() || 'jpg';
+        const filePath = `${userId}/avatar.${fileExt}`;
+
+        const { error: uploadError } = await supabase.storage
+          .from('avatars')
+          .upload(filePath, editAvatarFile, { upsert: true });
+
+        if (uploadError) {
+          toast.error("头像上传失败");
+          setSavingProfile(false);
+          return;
+        }
+
+        const { data: urlData } = supabase.storage
+          .from('avatars')
+          .getPublicUrl(filePath);
+
+        await supabase
+          .from('profiles')
+          .update({ avatar_url: urlData.publicUrl })
+          .eq('id', userId);
+
+        setAvatarUrl(urlData.publicUrl);
+      }
+
+      setDisplayName(editName.trim());
+      toast.success("个人信息已更新");
+      setShowProfile(false);
     } catch {
-      toast.error("连接服务器失败");
+      toast.error("更新失败");
     }
     setSavingProfile(false);
   };
@@ -161,26 +193,24 @@ export default function OnlinePage() {
     );
   }
 
-  // 用户名 + 头像按钮（大厅和房间共用）
+  // 用户名 + 头像按钮
   const UserBadge = ({ dark }: { dark?: boolean }) => (
     <button
       onClick={handleOpenProfile}
       className={`flex items-center gap-2 px-2 py-1 rounded-lg transition ${
-        dark
-          ? 'hover:bg-slate-800'
-          : 'hover:bg-slate-100'
+        dark ? 'hover:bg-slate-800' : 'hover:bg-slate-100'
       }`}
     >
-      {profileData.avatar ? (
-        <img src={profileData.avatar} alt="头像" className="w-7 h-7 rounded-full object-cover" />
+      {avatarUrl ? (
+        <img src={avatarUrl} alt="头像" className="w-7 h-7 rounded-full object-cover" />
       ) : (
         <div className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold ${
           dark ? 'bg-slate-700 text-cyan-400' : 'bg-slate-200 text-slate-500'
         }`}>
-          {user?.[0] || '?'}
+          {displayName?.[0] || '?'}
         </div>
       )}
-      <span className={`text-sm ${dark ? 'text-slate-300' : 'text-slate-600'}`}>{user}</span>
+      <span className={`text-sm ${dark ? 'text-slate-300' : 'text-slate-600'}`}>{displayName}</span>
     </button>
   );
 
@@ -188,7 +218,6 @@ export default function OnlinePage() {
   if (view === 'lobby') {
     return (
       <div className="min-h-screen bg-slate-900 text-white flex flex-col">
-        {/* 顶栏 */}
         <header className="flex justify-between items-center px-6 py-4 border-b border-slate-800">
           <div className="flex items-center gap-2">
             <span className="text-2xl">🐟</span>
@@ -200,12 +229,11 @@ export default function OnlinePage() {
           </div>
         </header>
 
-        {/* 主内容 */}
         <div className="flex-1 flex items-center justify-center p-4">
           <div className="w-full max-w-md space-y-6">
             <div className="text-center">
               <h1 className="text-3xl font-bold mb-2">调查员大厅</h1>
-              <p className="text-slate-500 text-xl">调查员{user}已接入系统。</p>
+              <p className="text-slate-500 text-xl">调查员{displayName}已接入系统。</p>
               <p className="text-slate-500 text-xl">系统功能仍在缓慢开发中，敬请期待。</p>
             </div>
 
@@ -262,17 +290,14 @@ export default function OnlinePage() {
                 </button>
               </div>
             </div>
-
-            
           </div>
         </div>
 
-        {/* 个人信息弹窗 */}
         {showProfile && (
           <ProfileModal
             editName={editName}
             setEditName={setEditName}
-            editAvatar={editAvatar}
+            editAvatarPreview={editAvatarPreview}
             handleAvatarChange={handleAvatarChange}
             fileInputRef={fileInputRef}
             handleSave={handleSaveProfile}
@@ -289,7 +314,6 @@ export default function OnlinePage() {
   if (view === 'characters') {
     return (
       <div className="min-h-screen bg-slate-50 text-black font-sans">
-        {/* 顶栏 */}
         <header className="flex justify-between items-center px-6 py-4 bg-white border-b border-slate-200 shadow-sm sticky top-0 z-10">
           <div className="flex items-center gap-4">
             <button
@@ -304,17 +328,15 @@ export default function OnlinePage() {
           <UserBadge />
         </header>
 
-        {/* 内容区 */}
         <div className="max-w-6xl mx-auto p-4">
-          <CharacterManager email={email!} />
+          <CharacterManager userId={userId!} />
         </div>
 
-        {/* 个人信息弹窗 */}
         {showProfile && (
           <ProfileModal
             editName={editName}
             setEditName={setEditName}
-            editAvatar={editAvatar}
+            editAvatarPreview={editAvatarPreview}
             handleAvatarChange={handleAvatarChange}
             fileInputRef={fileInputRef}
             handleSave={handleSaveProfile}
@@ -333,7 +355,6 @@ export default function OnlinePage() {
       <Sidebar activeTab={activeTab} onTabChange={setActiveTab} />
 
       <main className="flex-1 flex flex-col min-w-0 overflow-hidden">
-        {/* 房间信息栏 */}
         <div className="flex items-center justify-between px-6 py-3 bg-white border-b border-slate-200 shadow-sm flex-shrink-0">
           <div className="flex items-center gap-4">
             <div className="flex items-center gap-2">
@@ -344,7 +365,6 @@ export default function OnlinePage() {
             <span className={`text-xs px-2 py-1 rounded-md font-bold ${isKP ? 'bg-slate-900 text-white' : 'bg-blue-100 text-blue-600'}`}>
               {isKP ? 'KP 守秘人' : 'PL 玩家'}
             </span>
-            {/* TODO: 房间内玩家列表 */}
             <span className="text-xs text-slate-300 hidden sm:block">在线: 1人</span>
           </div>
 
@@ -359,7 +379,6 @@ export default function OnlinePage() {
           </div>
         </div>
 
-        {/* 内容区 */}
         <div className="flex-1 overflow-y-auto custom-scrollbar">
           <div className="w-full h-full p-4">
             {activeTab === 'import' && (
@@ -378,12 +397,11 @@ export default function OnlinePage() {
         </div>
       </main>
 
-      {/* 个人信息弹窗 */}
       {showProfile && (
         <ProfileModal
           editName={editName}
           setEditName={setEditName}
-          editAvatar={editAvatar}
+          editAvatarPreview={editAvatarPreview}
           handleAvatarChange={handleAvatarChange}
           fileInputRef={fileInputRef}
           handleSave={handleSaveProfile}
@@ -400,7 +418,7 @@ export default function OnlinePage() {
 function ProfileModal({
   editName,
   setEditName,
-  editAvatar,
+  editAvatarPreview,
   handleAvatarChange,
   fileInputRef,
   handleSave,
@@ -410,7 +428,7 @@ function ProfileModal({
 }: {
   editName: string;
   setEditName: (v: string) => void;
-  editAvatar: string;
+  editAvatarPreview: string;
   handleAvatarChange: (e: React.ChangeEvent<HTMLInputElement>) => void;
   fileInputRef: React.RefObject<HTMLInputElement | null>;
   handleSave: () => void;
@@ -434,8 +452,8 @@ function ProfileModal({
           <div className="relative w-20 h-20 rounded-full overflow-hidden border-2 border-slate-600 group cursor-pointer"
             onClick={() => fileInputRef.current?.click()}
           >
-            {editAvatar ? (
-              <img src={editAvatar} alt="头像" className="w-full h-full object-cover" />
+            {editAvatarPreview ? (
+              <img src={editAvatarPreview} alt="头像" className="w-full h-full object-cover" />
             ) : (
               <div className="w-full h-full flex items-center justify-center bg-slate-700 text-2xl font-bold text-cyan-400">
                 {editName?.[0] || '?'}
