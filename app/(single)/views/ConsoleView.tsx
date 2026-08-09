@@ -737,7 +737,7 @@ export default function ConsoleView({ characters, setCharacters }: ConsoleViewPr
             { label: "SAN", key: "san", color: "bg-purple-500", text: "text-purple-600", icon: "🧠" },
             { label: "LUCK", key: "luck", color: "bg-amber-500", text: "text-amber-600", icon: "🍀" }
           ].map(stat => {
-            const isMissing = !currentChar || (currentChar.type === 'mob' && (stat.key === 'san' || stat.key === 'luck'));
+            const isMissing = !currentChar || (currentChar.type === 'mob' && stat.key === 'luck');
             return (
               <div key={stat.key} className={`bg-white p-4 rounded-[2rem] border border-slate-200 shadow-sm relative overflow-hidden group ${isMissing ? 'opacity-30' : ''}`}>
                 <div className="flex justify-between items-start mb-2">

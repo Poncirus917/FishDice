@@ -3,6 +3,8 @@ import { useState, useEffect, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import toast from 'react-hot-toast';
 import { supabase } from '../lib/supabase';
+import CharacterManager from './modules/CharacterManager';
+import AvatarCropper from './modules/AvatarCropper';
 
 export default function OnlinePage() {
   const router = useRouter();
@@ -10,7 +12,7 @@ export default function OnlinePage() {
   const [checking, setChecking] = useState(true);
 
   // 房间状态
-  const [view, setView] = useState<'lobby' | 'room' | 'characters'>('lobby');
+  const [view, setView] = useState<'lobby' | 'room' | 'characters'|'simulation'>('lobby');
   const [roomCode, setRoomCode] = useState('');
   const [joinCode, setJoinCode] = useState('');
   const [isKP, setIsKP] = useState(false);
@@ -22,6 +24,8 @@ export default function OnlinePage() {
   const [editName, setEditName] = useState('');
   const [editAvatarFile, setEditAvatarFile] = useState<File | null>(null);
   const [editAvatarPreview, setEditAvatarPreview] = useState('');
+  const [cropperSrc, setCropperSrc] = useState<string | null>(null);
+  const [croppedAvatar, setCroppedAvatar] = useState<string | null>(null);
   const [savingProfile, setSavingProfile] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -43,10 +47,14 @@ export default function OnlinePage() {
         .single();
 
       if (profile) {
-        setDisplayName(profile.display_name || session.user.email || '调查员');
+        const name = profile.display_name || session.user.email || '调查员';
+        setDisplayName(name);
         setAvatarUrl(profile.avatar_url || '');
+        localStorage.setItem('fish_display_name', name);
       } else {
-        setDisplayName(session.user.email || '调查员');
+        const name = session.user.email || '调查员';
+        setDisplayName(name);
+        localStorage.setItem('fish_display_name', name);
       }
       setChecking(false);
     });
@@ -91,6 +99,7 @@ export default function OnlinePage() {
     setEditName(displayName);
     setEditAvatarPreview(avatarUrl);
     setEditAvatarFile(null);
+    setCroppedAvatar(null);
     setShowProfile(true);
   };
 
@@ -98,14 +107,20 @@ export default function OnlinePage() {
   const handleAvatarChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    if (file.size > 2 * 1024 * 1024) {
-      toast.error("头像图片不能超过2MB");
+    if (file.size > 5 * 1024 * 1024) {
+      toast.error("头像图片不能超过5MB");
       return;
     }
-    setEditAvatarFile(file);
     const reader = new FileReader();
-    reader.onload = () => setEditAvatarPreview(reader.result as string);
+    reader.onload = () => setCropperSrc(reader.result as string);
     reader.readAsDataURL(file);
+    e.target.value = '';
+  };
+
+  const handleCropperConfirm = (croppedDataUrl: string) => {
+    setCroppedAvatar(croppedDataUrl);
+    setEditAvatarPreview(croppedDataUrl);
+    setCropperSrc(null);
   };
 
   // 保存个人信息
@@ -133,14 +148,16 @@ export default function OnlinePage() {
         return;
       }
 
-      // 如果选了新头像，上传到 Storage
-      if (editAvatarFile) {
-        const fileExt = editAvatarFile.name.split('.').pop() || 'jpg';
+      // 如果裁剪了新头像，上传到 Storage
+      if (croppedAvatar) {
+        const base64Response = await fetch(croppedAvatar);
+        const blob = await base64Response.blob();
+        const fileExt = 'png';
         const filePath = `${userId}/avatar.${fileExt}`;
 
         const { error: uploadError } = await supabase.storage
           .from('avatars')
-          .upload(filePath, editAvatarFile, { upsert: true });
+          .upload(filePath, blob, { upsert: true });
 
         if (uploadError) {
           toast.error("头像上传失败");
@@ -161,6 +178,7 @@ export default function OnlinePage() {
       }
 
       setDisplayName(editName.trim());
+      localStorage.setItem('fish_display_name', editName.trim());
       toast.success("个人信息已更新");
       setShowProfile(false);
     } catch {
@@ -214,64 +232,84 @@ export default function OnlinePage() {
         </header>
 
         <div className="flex-1 flex items-center justify-center p-4">
-          <div className="w-full max-w-md space-y-6">
+          <div className="w-full max-w-2xl space-y-6">
             <div className="text-center">
               <h1 className="text-3xl font-bold mb-2">调查员大厅</h1>
               <p className="text-slate-500 text-xl">调查员{displayName}已接入系统。</p>
               <p className="text-slate-500 text-xl">系统功能仍在开发中，敬请期待。</p>
             </div>
 
-            {/* 角色管理 */}
-            <div className="bg-slate-800 rounded-2xl p-6 border border-slate-700 hover:border-cyan-800 transition">
-              <h2 className="font-bold mb-2 flex items-center gap-2">
-                <span className="text-xl">📚</span> 角色管理
-              </h2>
-              <p className="text-slate-400 text-xs mb-4 leading-relaxed">创建和管理你的 PC、NPC 和怪物，数据跟随账号保存</p>
-              <button
-                onClick={() => setView('characters')}
-                className="w-full py-3 bg-slate-700 hover:bg-cyan-600 rounded-xl font-bold transition active:scale-[0.98]"
-              >
-                进入角色管理
-              </button>
-            </div>
-
-            {/* 创建房间 */}
-            <div className="bg-slate-800 rounded-2xl p-6 border border-slate-700 hover:border-cyan-800 transition">
-              <h2 className="font-bold mb-2 flex items-center gap-2">
-                <span className="text-xl">🎭</span> 创建房间
-              </h2>
-              <p className="text-slate-400 text-xs mb-4 leading-relaxed">作为 KP 创建新房间，获得4位房间号分享给玩家</p>
-              <button
-                onClick={handleCreateRoom}
-                className="w-full py-3 bg-cyan-600 hover:bg-cyan-500 rounded-xl font-bold transition active:scale-[0.98] shadow-lg shadow-cyan-900/30"
-              >
-                创建新房间
-              </button>
-            </div>
-
-            {/* 加入房间 */}
-            <div className="bg-slate-800 rounded-2xl p-6 border border-slate-700 hover:border-cyan-800 transition">
-              <h2 className="font-bold mb-2 flex items-center gap-2">
-                <span className="text-xl">🚪</span> 加入房间
-              </h2>
-              <p className="text-slate-400 text-xs mb-4 leading-relaxed">输入 KP 分享的4位房间号</p>
-              <div className="flex gap-2">
-                <input
-                  type="text"
-                  maxLength={4}
-                  value={joinCode}
-                  onChange={(e) => setJoinCode(e.target.value.replace(/\D/g, ''))}
-                  onKeyDown={(e) => e.key === 'Enter' && handleJoinRoom()}
-                  className="flex-1 p-3 text-center text-2xl font-bold tracking-[0.5em] bg-slate-900 border border-slate-700 rounded-xl outline-none focus:border-cyan-500 transition"
-                  placeholder="0000"
-                />
+            {/* 第一行：角色管理 + 战斗模拟 */}
+            <div className="grid grid-cols-2 gap-10">
+              {/* 角色管理 */}
+              <div className="bg-slate-800 rounded-2xl p-8 border border-slate-700 hover:border-cyan-800 transition flex flex-col">
+                <h2 className="font-bold mb-2 flex items-center gap-2 text-lg">
+                  <span className="text-2xl">📚</span> 角色管理
+                </h2>
+                <p className="text-slate-400 text-sm mb-6 leading-relaxed flex-1">创建和管理你的 PC、NPC 和怪物，数据跟随账号保存</p>
                 <button
-                  onClick={handleJoinRoom}
-                  disabled={joinCode.length !== 4}
-                  className="px-6 bg-slate-700 hover:bg-cyan-600 disabled:opacity-30 disabled:cursor-not-allowed rounded-xl font-bold transition"
+                  onClick={() => setView('characters')}
+                  className="w-full py-3 bg-slate-700 hover:bg-cyan-600 rounded-xl font-bold transition active:scale-[0.98]"
                 >
-                  加入
+                  进入角色管理
                 </button>
+              </div>
+
+              {/* 战斗模拟 */}
+              <div className="bg-slate-800 rounded-2xl p-8 border border-slate-700 hover:border-cyan-800 transition flex flex-col">
+                <h2 className="font-bold mb-2 flex items-center gap-2 text-lg">
+                  <span className="text-2xl">⚔️</span> 战斗模拟
+                </h2>
+                <p className="text-slate-400 text-sm mb-6 leading-relaxed flex-1">战斗自动模拟系统</p>
+                <button
+                  onClick={() => setView('simulation')}
+                  className="w-full py-3 bg-slate-700 hover:bg-cyan-600 rounded-xl font-bold transition active:scale-[0.98]"
+                >
+                  进入战斗模拟
+                </button>
+              </div>
+            </div>
+
+            {/* 第二行：创建房间 + 加入房间 */}
+            <div className="grid grid-cols-2 gap-10">
+              {/* 创建房间 */}
+              <div className="bg-slate-800 rounded-2xl p-8 border border-slate-700 hover:border-cyan-800 transition flex flex-col">
+                <h2 className="font-bold mb-2 flex items-center gap-2 text-lg">
+                  <span className="text-2xl">🎭</span> 创建房间
+                </h2>
+                <p className="text-slate-400 text-sm mb-6 leading-relaxed flex-1">作为 KP 创建新房间，获得4位房间号分享给玩家</p>
+                <button
+                  onClick={handleCreateRoom}
+                  className="w-full py-3 bg-cyan-600 hover:bg-cyan-500 rounded-xl font-bold transition active:scale-[0.98] shadow-lg shadow-cyan-900/30"
+                >
+                  创建新房间
+                </button>
+              </div>
+
+              {/* 加入房间 */}
+              <div className="bg-slate-800 rounded-2xl p-8 border border-slate-700 hover:border-cyan-800 transition flex flex-col">
+                <h2 className="font-bold mb-2 flex items-center gap-2 text-lg">
+                  <span className="text-2xl">🚪</span> 加入房间
+                </h2>
+                <p className="text-slate-400 text-sm mb-6 leading-relaxed flex-1">输入 KP 分享的4位房间号</p>
+                <div className="flex gap-2 items-center">
+                  <input
+                    type="text"
+                    maxLength={4}
+                    value={joinCode}
+                    onChange={(e) => setJoinCode(e.target.value.replace(/\D/g, ''))}
+                    onKeyDown={(e) => e.key === 'Enter' && handleJoinRoom()}
+                    className="w-24 p-2.5 text-center text-xl font-bold tracking-[0.3em] bg-slate-900 border border-slate-700 rounded-xl outline-none focus:border-cyan-500 transition"
+                    placeholder="0000"
+                  />
+                  <button
+                    onClick={handleJoinRoom}
+                    disabled={joinCode.length !== 4}
+                    className="flex-1 py-3 bg-slate-700 hover:bg-cyan-600 disabled:opacity-30 disabled:cursor-not-allowed rounded-xl font-bold transition whitespace-nowrap"
+                  >
+                    加入
+                  </button>
+                </div>
               </div>
             </div>
           </div>
@@ -290,31 +328,40 @@ export default function OnlinePage() {
             saving={savingProfile}
           />
         )}
+
+        {cropperSrc && (
+          <AvatarCropper
+            src={cropperSrc}
+            onConfirm={handleCropperConfirm}
+            onCancel={() => setCropperSrc(null)}
+            size={256}
+          />
+        )}
       </div>
     );
   }
 
   // ===================== 开发中占位视图 =====================
   const DevelopingView = ({ title, onBack }: { title: string; onBack: () => void }) => (
-    <div className="min-h-screen bg-slate-50 text-black font-sans">
-      <header className="flex justify-between items-center px-6 py-4 bg-white border-b border-slate-200 shadow-sm sticky top-0 z-10">
+    <div className="min-h-screen bg-slate-900 text-white font-sans flex flex-col">
+      <header className="flex justify-between items-center px-6 py-4 border-b border-slate-800 sticky top-0 z-10">
         <div className="flex items-center gap-4">
           <button
             onClick={onBack}
-            className="text-slate-400 hover:text-cyan-600 text-sm font-bold transition"
+            className="text-slate-400 hover:text-cyan-400 text-sm font-bold transition"
           >
             ← 返回大厅
           </button>
-          <div className="h-4 w-px bg-slate-200" />
+          <div className="h-4 w-px bg-slate-700" />
           <span className="font-bold text-lg">{title}</span>
         </div>
-        <UserBadge />
+        <UserBadge dark />
       </header>
       <div className="flex-1 flex items-center justify-center p-4">
         <div className="text-center">
           <div className="text-6xl mb-4">🔧</div>
-          <h2 className="text-2xl font-bold text-slate-700 mb-2">开发中</h2>
-          <p className="text-slate-400">此功能正在紧锣密鼓地开发中，敬请期待。</p>
+          <h2 className="text-2xl font-bold text-slate-300 mb-2">开发中</h2>
+          <p className="text-slate-500">此功能正在紧锣密鼓地开发中，敬请期待。</p>
         </div>
       </div>
       {showProfile && (
@@ -332,10 +379,46 @@ export default function OnlinePage() {
       )}
     </div>
   );
-
   // ===================== 角色管理视图 =====================
   if (view === 'characters') {
-    return <DevelopingView title="📚 角色管理" onBack={() => setView('lobby')} />;
+    return (
+      <div className="min-h-screen bg-slate-900 text-white flex flex-col">
+        <header className="flex justify-between items-center px-6 py-4 border-b border-slate-800 sticky top-0 z-20 bg-slate-900">
+          <div className="flex items-center gap-4">
+            <button
+              onClick={() => setView('lobby')}
+              className="text-slate-400 hover:text-cyan-400 text-sm font-bold transition"
+            >
+              ← 返回大厅
+            </button>
+            <div className="h-4 w-px bg-slate-700" />
+            <span className="font-bold text-lg">📚 角色管理</span>
+          </div>
+          <UserBadge dark />
+        </header>
+        <div className="flex-1 overflow-hidden">
+          {userId && <CharacterManager userId={userId} />}
+        </div>
+        {showProfile && (
+          <ProfileModal
+            editName={editName}
+            setEditName={setEditName}
+            editAvatarPreview={editAvatarPreview}
+            handleAvatarChange={handleAvatarChange}
+            fileInputRef={fileInputRef}
+            handleSave={handleSaveProfile}
+            handleClose={() => setShowProfile(false)}
+            handleLogout={handleLogout}
+            saving={savingProfile}
+          />
+        )}
+      </div>
+    );
+  }
+
+  // ===================== 战斗模拟视图 =====================
+  if (view === 'simulation') {
+    return <DevelopingView title="📚 战斗模拟" onBack={() => setView('lobby')} />;
   }
 
   // ===================== 房间视图 =====================
@@ -400,7 +483,7 @@ function ProfileModal({
             className="hidden"
             onChange={handleAvatarChange}
           />
-          <p className="text-xs text-slate-500 mt-2">点击头像更换，最大2MB</p>
+          <p className="text-xs text-slate-500 mt-2">点击头像更换，最大5MB</p>
         </div>
 
         {/* 用户名 */}

@@ -1,36 +1,68 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# 鱼骰 FishDice
 
-## Getting Started
+COC（克苏鲁的呼唤）跑团辅助工具，个人兴趣项目，持续开发中。
+使用COC 7版游戏规则。房规：大成功为1-3，大失败为98-100。
 
-First, run the development server:
+## 在线体验
+
+| 版本 | 地址 | 状态 |
+|------|------|------|
+| 单机版 | [fish-dice.pages.dev](https://fish-dice.pages.dev) | 已完成 |
+| 联机版 | [fish-dice-online.pages.dev](https://fish-dice-online.pages.dev) | 开发中 |
+
+## 单机版
+
+供单人使用的本地掷骰工具，无需登录，打开即用。
+功能已基本完成，除非发现有bug不会再改动。
+
+### 功能
+
+- **角色导入与管理**：支持PC、NPC、怪物三种类型，文本解析一键导入，可编辑、删除
+- **掷骰判定**：技能/属性检定、自由掷骰，结果自动判定
+- **规则联动**：HP/SAN变化时自动触发重伤、濒死、死亡、临时疯狂等状态判定
+- **特殊规则**：燃烧幸运、孤注一掷、幕间成长
+- **记录导出**：实时记录所有掷骰与状态变化，可导出为 TXT 文件
+
+## 联机版
+
+支持多人在线联机的跑团平台，正在开发中。
+
+### 已完成
+
+- 用户注册 / 登录 / 密码重置（邮箱验证码）
+- 个人信息管理（用户名、头像）
+- 用户名唯一性校验
+- 角色数据云端存储（绑定用户）
+
+### 开发中
+
+- 房间系统
+- 角色管理系统
+- 角色数据实时同步
+- 实时掷骰同步
+- 暗骰功能
+- KP / PL 权限分离
+- 规则速查
+- 战斗模拟
+- ……
+
+## 技术栈
+
+- **前端**：Next.js + TypeScript + Tailwind CSS v4
+- **后端**：Supabase（Auth + PostgreSQL + Realtime + Storage）
+- **部署**：Cloudflare Pages
+
+## 本地开发
 
 ```bash
+# 安装依赖
+npm install
+
+# 启动开发服务器
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+
+# 构建生产版本
+npm run build
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
-
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
-
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
-
-## Learn More
-
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+联机版需要配置 Supabase 环境变量，参考 `.env.example`。

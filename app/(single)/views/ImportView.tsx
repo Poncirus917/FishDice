@@ -51,20 +51,32 @@ export default function ImportView({ onConfirm, characters, setCharacters }: Imp
     const siz = clamp(tempSkills["体型"] || 0);
     const pow = clamp(tempSkills["意志"] || 0);
 
-    const finalHP = Math.floor((con + siz) / 10);
-    const finalMP = Math.floor(pow / 5);
+    const isMob = activeTab === 'mob';
+    
+    const finalHP = isMob 
+      ? clamp(tempSkills["体力（HP）"] || 0)
+      : Math.floor((con + siz) / 10);
+    const finalMP = isMob 
+      ? clamp(tempSkills["魔法（MP）"] || 0)
+      : Math.floor(pow / 5);
+    
+    const excludedFromSkills = ["力量", "敏捷", "意志", "体质", "外貌", "教育", "体型", "智力", "体力（HP）", "魔法（MP）", "理智", "幸运"];
     
     const newChar: CharacterState = {
       id: editingId || Date.now().toString(),
       name: name || (activeTab === 'pc' ? "未命名调查员" : "未命名生物"),
-      type: activeTab, // 核心修改：保存当前选择的类型
+      type: activeTab,
       plName: activeTab === 'pc' ? (plName || "未知PL") : "GM操作",
       avatar: avatar || undefined,
       hp: { current: finalHP, max: finalHP },
       mp: { current: finalMP, max: finalMP },
-      san: { current: activeTab === 'mob' ? 0 : pow , max: 99 }, // 怪物通常SAN为0
+      san: { current: isMob ? clamp(tempSkills["理智"] || 0) : pow , max: 99 },
       luck: { current: clamp(tempSkills["幸运"] || 0), max: 99 },
-      skills: Object.fromEntries(Object.entries(tempSkills).map(([k, v]) => [k, clamp(v)])),
+      skills: Object.fromEntries(
+        Object.entries(tempSkills)
+          .filter(([k]) => !excludedFromSkills.includes(k))
+          .map(([k, v]) => [k, clamp(v)])
+      ),
       attributes: {
         "力量": clamp(tempSkills["力量"] || 0),
         "敏捷": clamp(tempSkills["敏捷"] || 0),
@@ -263,10 +275,10 @@ export default function ImportView({ onConfirm, characters, setCharacters }: Imp
                   <h4 className="text-sm font-bold text-slate-700 mb-4 uppercase">核心属性</h4>
                   <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
                     {["力量", "敏捷", "意志", "体质", "外貌", "教育", "体型", "智力", "体力（HP）", "魔法（MP）", "理智", "幸运"].map(attr => {
-                      if(attr === "理智" && (activeTab !== 'pc' && activeTab!='npc')) return null;
+                      if(attr === "理智" && (activeTab !== 'pc' && activeTab !== 'npc' && activeTab !== 'mob')) return null;
                       
                       const isDerived = activeTab === 'mob' 
-                        ? (attr === "理智") 
+                        ? false 
                         : ["体力（HP）", "魔法（MP）", "理智"].includes(attr);
 
                       let displayValue = tempSkills[attr] || 0;
