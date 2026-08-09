@@ -441,7 +441,7 @@ function CharacterDetailView({
         html: `
           <div class="text-left text-sm text-slate-600 mb-3">
             将此分享码发给好友，他们可以导入该角色。<br/>
-            <span class="text-amber-600 font-bold">注意：</span> PC/NPC 角色导入后将变为 NPC（仅可由使用者作为 GM 操作）。
+            <span class="text-amber-600 font-bold">注意：</span> PC/NPC 角色导入后将变为 NPC；怪物导入后仍为怪物。
           </div>
           <textarea id="share-code" class="w-full p-3 border-2 border-slate-300 rounded-xl text-xs font-mono bg-slate-50 text-slate-800 select-all" rows="4" readonly>${code}</textarea>
         `,

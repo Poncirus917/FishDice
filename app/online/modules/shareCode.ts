@@ -1,26 +1,40 @@
 import type { CharacterState } from '@/app/(single)/page';
+import lzString from 'lz-string';
 
 const SHARE_PREFIX = 'COC-';
-const SHARE_VERSION = 1;
+const SHARE_VERSION = 2;
 
 export function encodeShareCode(character: CharacterState): string {
-  const shareData = {
-    v: SHARE_VERSION,
-    n: character.name,
-    t: character.type,
-    a: character.attributes,
-    s: character.skills,
-    h: character.hp,
-    m: character.mp,
-    p: character.san,
-    l: character.luck,
-    st: character.story,
-    av: character.avatar,
-  };
+  const coreAttrs = character.attributes;
+  const attrArr = [
+    coreAttrs['力量'] || 0,
+    coreAttrs['敏捷'] || 0,
+    coreAttrs['意志'] || 0,
+    coreAttrs['体质'] || 0,
+    coreAttrs['外貌'] || 0,
+    coreAttrs['教育'] || 0,
+    coreAttrs['体型'] || 0,
+    coreAttrs['智力'] || 0,
+  ];
 
-  const json = JSON.stringify(shareData);
-  const base64 = btoa(unescape(encodeURIComponent(json)));
-  return `${SHARE_PREFIX}${base64}`;
+  const skillArr = Object.entries(character.skills).map(([k, v]) => `${k}:${v}`);
+
+  const parts = [
+    String(SHARE_VERSION),
+    character.name,
+    character.type,
+    attrArr.join(','),
+    skillArr.join('|'),
+    `${character.hp.current}/${character.hp.max}`,
+    `${character.mp.current}/${character.mp.max}`,
+    `${character.san.current}/${character.san.max}`,
+    `${character.luck.current}/${character.luck.max}`,
+    character.story || '',
+  ];
+
+  const raw = parts.join('\u0001');
+  const compressed = lzString.compressToEncodedURIComponent(raw);
+  return `${SHARE_PREFIX}${compressed}`;
 }
 
 export function decodeShareCode(code: string): Omit<CharacterState, 'id'> {
@@ -29,27 +43,52 @@ export function decodeShareCode(code: string): Omit<CharacterState, 'id'> {
     throw new Error('无效的分享码格式');
   }
 
-  const base64 = cleanCode.slice(SHARE_PREFIX.length);
+  const encoded = cleanCode.slice(SHARE_PREFIX.length);
   try {
-    const json = decodeURIComponent(escape(atob(base64)));
-    const data = JSON.parse(json);
+    const raw = lzString.decompressFromEncodedURIComponent(encoded);
+    if (!raw) throw new Error('分享码解析失败');
 
-    if (data.v !== SHARE_VERSION) {
-      throw new Error(`不支持的分享版本: ${data.v}`);
+    const parts = raw.split('\u0001');
+    const version = parseInt(parts[0]);
+
+    if (version !== SHARE_VERSION) {
+      throw new Error(`不支持的分享版本: ${version}`);
     }
 
+    const name = parts[1];
+    const type = parts[2] as 'pc' | 'npc' | 'mob';
+    const attrArr = parts[3].split(',').map(Number);
+    const skillArr = parts[4] ? parts[4].split('|').map(pair => {
+      const [k, v] = pair.split(':');
+      return [k, parseInt(v) || 0] as const;
+    }) : [];
+
+    const [hpCur, hpMax] = parts[5].split('/').map(Number);
+    const [mpCur, mpMax] = parts[6].split('/').map(Number);
+    const [sanCur, sanMax] = parts[7].split('/').map(Number);
+    const [luckCur, luckMax] = parts[8].split('/').map(Number);
+    const story = parts[9];
+
     return {
-      name: data.n,
-      type: data.t,
+      name,
+      type,
       plName: '',
-      attributes: data.a,
-      skills: data.s,
-      hp: data.h,
-      mp: data.m,
-      san: data.p,
-      luck: data.l,
-      story: data.st,
-      avatar: data.av,
+      attributes: {
+        '力量': attrArr[0],
+        '敏捷': attrArr[1],
+        '意志': attrArr[2],
+        '体质': attrArr[3],
+        '外貌': attrArr[4],
+        '教育': attrArr[5],
+        '体型': attrArr[6],
+        '智力': attrArr[7],
+      },
+      skills: Object.fromEntries(skillArr),
+      hp: { current: hpCur, max: hpMax },
+      mp: { current: mpCur, max: mpMax },
+      san: { current: sanCur, max: sanMax },
+      luck: { current: luckCur, max: luckMax },
+      story: story || undefined,
       status: [],
     } as Omit<CharacterState, 'id'>;
   } catch (e) {
