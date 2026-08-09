@@ -377,8 +377,17 @@ export default function OnlinePage() {
           saving={savingProfile}
         />
       )}
+      {cropperSrc && (
+        <AvatarCropper
+          src={cropperSrc}
+          onConfirm={handleCropperConfirm}
+          onCancel={() => setCropperSrc(null)}
+          size={256}
+        />
+      )}
     </div>
   );
+
   // ===================== 角色管理视图 =====================
   if (view === 'characters') {
     return (
@@ -410,6 +419,14 @@ export default function OnlinePage() {
             handleClose={() => setShowProfile(false)}
             handleLogout={handleLogout}
             saving={savingProfile}
+          />
+        )}
+        {cropperSrc && (
+          <AvatarCropper
+            src={cropperSrc}
+            onConfirm={handleCropperConfirm}
+            onCancel={() => setCropperSrc(null)}
+            size={256}
           />
         )}
       </div>

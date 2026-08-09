@@ -65,7 +65,7 @@ export default function ImportView({ onConfirm, characters, setCharacters, userD
           <span class="font-bold text-cyan-600">•</span> PC/NPC 角色将变为 NPC；怪物导入后仍为怪物<br/>
           <span class="font-bold text-red-600">•</span> 怪物角色保持为怪物
         </div>
-        <textarea id="import-code" class="w-full p-3 border-2 border-slate-300 rounded-xl text-xs font-mono bg-slate-50 text-slate-800" rows="4" placeholder="粘贴 COC- 开头的分享码..."></textarea>
+        <textarea id="import-code" class="w-full p-3 border-2 border-slate-300 rounded-xl text-xs font-mono bg-slate-50 text-slate-800" rows="4" placeholder="粘贴 FD- 开头的分享码..."></textarea>
       `,
       showConfirmButton: true,
       showCancelButton: true,

@@ -1,8 +1,11 @@
 import type { CharacterState } from '@/app/(single)/page';
 import lzString from 'lz-string';
 
-const SHARE_PREFIX = 'COC-';
-const SHARE_VERSION = 2;
+const SHARE_PREFIX = 'FD-';
+const SHARE_VERSION = 3;
+
+const TYPE_MAP: Record<string, string> = { pc: 'p', npc: 'n', mob: 'm' };
+const TYPE_REVERSE: Record<string, 'pc' | 'npc' | 'mob'> = { p: 'pc', n: 'npc', m: 'mob' };
 
 export function encodeShareCode(character: CharacterState): string {
   const coreAttrs = character.attributes;
@@ -17,24 +20,38 @@ export function encodeShareCode(character: CharacterState): string {
     coreAttrs['智力'] || 0,
   ];
 
-  const skillArr = Object.entries(character.skills).map(([k, v]) => `${k}:${v}`);
+  const typeShort = TYPE_MAP[character.type] || 'p';
 
-  const parts = [
+  const parts: string[] = [
     String(SHARE_VERSION),
     character.name,
-    character.type,
+    typeShort,
     attrArr.join(','),
-    skillArr.join('|'),
-    `${character.hp.current}/${character.hp.max}`,
-    `${character.mp.current}/${character.mp.max}`,
-    `${character.san.current}/${character.san.max}`,
-    `${character.luck.current}/${character.luck.max}`,
-    character.story || '',
   ];
 
+  // Skills: skip if empty
+  const skillEntries = Object.entries(character.skills);
+  if (skillEntries.length > 0) {
+    parts.push(skillEntries.map(([k, v]) => `${k}:${v}`).join('|'));
+  } else {
+    parts.push('');
+  }
+
+  // Derived stats
+  parts.push(`${character.hp.current},${character.hp.max}`);
+  parts.push(`${character.mp.current},${character.mp.max}`);
+  parts.push(`${character.san.current},${character.san.max}`);
+  parts.push(`${character.luck.current},${character.luck.max}`);
+
+  // Story: skip entirely if empty
+  if (character.story && character.story.trim()) {
+    parts.push(character.story);
+  }
+
   const raw = parts.join('\u0001');
-  const compressed = lzString.compressToEncodedURIComponent(raw);
-  return `${SHARE_PREFIX}${compressed}`;
+  const compressed = lzString.compressToBase64(raw);
+  const urlSafe = compressed.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  return `${SHARE_PREFIX}${urlSafe}`;
 }
 
 export function decodeShareCode(code: string): Omit<CharacterState, 'id'> {
@@ -45,7 +62,10 @@ export function decodeShareCode(code: string): Omit<CharacterState, 'id'> {
 
   const encoded = cleanCode.slice(SHARE_PREFIX.length);
   try {
-    const raw = lzString.decompressFromEncodedURIComponent(encoded);
+    // Convert base64url back to standard base64
+    const padded = encoded.replace(/-/g, '+').replace(/_/g, '/');
+    const padding = padded.length % 4 === 0 ? '' : '='.repeat(4 - (padded.length % 4));
+    const raw = lzString.decompressFromBase64(padded + padding);
     if (!raw) throw new Error('分享码解析失败');
 
     const parts = raw.split('\u0001');
@@ -56,18 +76,21 @@ export function decodeShareCode(code: string): Omit<CharacterState, 'id'> {
     }
 
     const name = parts[1];
-    const type = parts[2] as 'pc' | 'npc' | 'mob';
+    const type = TYPE_REVERSE[parts[2]] || 'pc';
     const attrArr = parts[3].split(',').map(Number);
-    const skillArr = parts[4] ? parts[4].split('|').map(pair => {
-      const [k, v] = pair.split(':');
-      return [k, parseInt(v) || 0] as const;
-    }) : [];
 
-    const [hpCur, hpMax] = parts[5].split('/').map(Number);
-    const [mpCur, mpMax] = parts[6].split('/').map(Number);
-    const [sanCur, sanMax] = parts[7].split('/').map(Number);
-    const [luckCur, luckMax] = parts[8].split('/').map(Number);
-    const story = parts[9];
+    const skillArr = parts[4]
+      ? parts[4].split('|').map(pair => {
+          const [k, v] = pair.split(':');
+          return [k, parseInt(v) || 0] as const;
+        })
+      : [];
+
+    const [hpCur, hpMax] = parts[5].split(',').map(Number);
+    const [mpCur, mpMax] = parts[6].split(',').map(Number);
+    const [sanCur, sanMax] = parts[7].split(',').map(Number);
+    const [luckCur, luckMax] = parts[8].split(',').map(Number);
+    const story = parts[9] || '';
 
     return {
       name,
