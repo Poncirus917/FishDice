@@ -21,6 +21,8 @@ export default function OnlinePage() {
   const [displayName, setDisplayName] = useState('');
   const [avatarUrl, setAvatarUrl] = useState('');
   const [avatarCacheKey, setAvatarCacheKey] = useState(0);
+  const [onlineCount, setOnlineCount] = useState(0);
+  const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
   const [showProfile, setShowProfile] = useState(false);
   const [editName, setEditName] = useState('');
   const [editAvatarFile, setEditAvatarFile] = useState<File | null>(null);
@@ -60,6 +62,59 @@ export default function OnlinePage() {
       setChecking(false);
     });
   }, [router]);
+
+  // 在线人数追踪 (Realtime Presence)
+  useEffect(() => {
+    if (!userId) return;
+
+    const channel = supabase.channel('online-users', {
+      config: {
+        presence: {
+          key: 'online',
+        },
+      },
+    });
+    channelRef.current = channel;
+
+    const getPresenceCount = () => {
+      const state = channel.presence.state as Record<string, unknown[]>;
+      const count = Object.values(state).reduce((sum, arr) => sum + (Array.isArray(arr) ? arr.length : 0), 0);
+      console.log('[Realtime] Presence state:', state, 'Count:', count);
+      return count;
+    };
+
+    channel.on('system', {}, (msg) => {
+      console.log('[Realtime] System event:', msg);
+    });
+
+    channel
+      .on('presence', { event: 'sync' }, () => {
+        console.log('[Realtime] Presence sync');
+        setOnlineCount(getPresenceCount());
+      })
+      .on('presence', { event: 'join' }, () => {
+        console.log('[Realtime] Presence join');
+        setOnlineCount(getPresenceCount());
+      })
+      .on('presence', { event: 'leave' }, () => {
+        console.log('[Realtime] Presence leave');
+        setOnlineCount(getPresenceCount());
+      })
+      .subscribe(async (status) => {
+        console.log('[Realtime] Subscribe status:', status);
+        if (status === 'SUBSCRIBED') {
+          await channel.track({ user_id: userId });
+          console.log('[Realtime] Tracked user:', userId);
+          setOnlineCount(getPresenceCount());
+        }
+      });
+
+    return () => {
+      channel.untrack();
+      channel.unsubscribe();
+      channelRef.current = null;
+    };
+  }, [userId]);
 
   // 创建房间
   const handleCreateRoom = () => {
@@ -222,6 +277,14 @@ export default function OnlinePage() {
     </button>
   );
 
+  // 在线人数徽章
+  const OnlineBadge = () => (
+    <div className="flex items-center gap-1.5 px-3 py-1 rounded-full bg-slate-800 border border-slate-700">
+      <span className={`inline-block w-2 h-2 rounded-full bg-emerald-400 animate-pulse`}></span>
+      <span className="text-xs text-slate-400">{Math.max(onlineCount, 1)}</span>
+    </div>
+  );
+
   // ===================== 大厅视图 =====================
   if (view === 'lobby') {
     return (
@@ -231,7 +294,8 @@ export default function OnlinePage() {
             <span className="text-2xl">🐟</span>
             <span className="font-bold text-lg">鱼骰 <span className="text-cyan-400 text-xs font-normal">联机版</span></span>
           </div>
-          <div className="flex items-center gap-4">
+          <div className="flex items-center gap-3">
+            <OnlineBadge />
             <UserBadge dark />
           </div>
         </header>
@@ -241,7 +305,10 @@ export default function OnlinePage() {
             <div className="text-center">
               <h1 className="text-3xl font-bold mb-2">调查员大厅</h1>
               <p className="text-slate-500 text-xl">调查员{displayName}已接入系统。</p>
-              <p className="text-slate-500 text-xl">系统功能仍在开发中，敬请期待。</p>
+              <div className="flex items-center justify-center gap-2 mt-2">
+                <span className={`inline-block w-2 h-2 rounded-full ${onlineCount > 0 ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500'}`}></span>
+                <span className="text-sm text-slate-400">目前共有 {Math.max(onlineCount, 1)} 位调查员在线。</span>
+              </div>
             </div>
 
             {/* 第一行：角色管理 + 战斗模拟 */}
@@ -360,7 +427,10 @@ export default function OnlinePage() {
           <div className="h-4 w-px bg-slate-700" />
           <span className="font-bold text-lg">{title}</span>
         </div>
-        <UserBadge dark />
+        <div className="flex items-center gap-3">
+          <OnlineBadge />
+          <UserBadge dark />
+        </div>
       </header>
       <div className="flex-1 flex items-center justify-center p-4">
         <div className="text-center">
@@ -408,7 +478,10 @@ export default function OnlinePage() {
             <div className="h-4 w-px bg-slate-700" />
             <span className="font-bold text-lg">📚 角色管理</span>
           </div>
-          <UserBadge dark />
+          <div className="flex items-center gap-3">
+            <OnlineBadge />
+            <UserBadge dark />
+          </div>
         </header>
         <div className="flex-1 overflow-hidden">
           {userId && <CharacterManager userId={userId} />}
