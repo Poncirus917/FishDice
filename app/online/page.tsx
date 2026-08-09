@@ -20,6 +20,7 @@ export default function OnlinePage() {
   // 个人信息
   const [displayName, setDisplayName] = useState('');
   const [avatarUrl, setAvatarUrl] = useState('');
+  const [avatarCacheKey, setAvatarCacheKey] = useState(0);
   const [showProfile, setShowProfile] = useState(false);
   const [editName, setEditName] = useState('');
   const [editAvatarFile, setEditAvatarFile] = useState<File | null>(null);
@@ -97,7 +98,10 @@ export default function OnlinePage() {
   // 打开个人信息弹窗
   const handleOpenProfile = () => {
     setEditName(displayName);
-    setEditAvatarPreview(avatarUrl);
+    const cacheBusted = avatarUrl
+      ? `${avatarUrl}${avatarUrl.includes('?') ? '&' : '?'}v=${Date.now()}`
+      : '';
+    setEditAvatarPreview(cacheBusted);
     setEditAvatarFile(null);
     setCroppedAvatar(null);
     setShowProfile(true);
@@ -175,6 +179,7 @@ export default function OnlinePage() {
           .eq('id', userId);
 
         setAvatarUrl(urlData.publicUrl);
+        setAvatarCacheKey(Date.now());
       }
 
       setDisplayName(editName.trim());
@@ -205,7 +210,7 @@ export default function OnlinePage() {
       }`}
     >
       {avatarUrl ? (
-        <img src={avatarUrl} alt="头像" className="w-7 h-7 rounded-full object-cover" />
+        <img src={`${avatarUrl}${avatarUrl.includes('?') ? '&' : '?'}v=${avatarCacheKey}`} alt="头像" className="w-7 h-7 rounded-full object-cover" />
       ) : (
         <div className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold ${
           dark ? 'bg-slate-700 text-cyan-400' : 'bg-slate-200 text-slate-500'
