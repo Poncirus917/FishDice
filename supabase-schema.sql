@@ -130,3 +130,85 @@ $$ LANGUAGE plpgsql SECURITY DEFINER;
 DROP POLICY IF EXISTS "Anyone can check email existence" ON profiles;
 CREATE POLICY "Anyone can check email existence" ON profiles
   FOR SELECT USING (true);
+
+-- ============================================
+-- 8. rooms 表（房间信息）
+-- ============================================
+CREATE TABLE IF NOT EXISTS rooms (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  room_code TEXT NOT NULL UNIQUE,
+  name TEXT NOT NULL CHECK (char_length(name) <= 30),
+  creator_id UUID REFERENCES auth.users(id) NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'paused', 'deleted')),
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_rooms_creator ON rooms(creator_id);
+CREATE INDEX IF NOT EXISTS idx_rooms_status ON rooms(status);
+CREATE INDEX IF NOT EXISTS idx_rooms_code ON rooms(room_code);
+
+-- 9. room_members 表（房间成员）
+CREATE TABLE IF NOT EXISTS room_members (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  room_id UUID REFERENCES rooms(id) ON DELETE CASCADE NOT NULL,
+  user_id UUID REFERENCES auth.users(id) NOT NULL,
+  character_id TEXT,
+  role TEXT NOT NULL CHECK (role IN ('kp', 'pl')),
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'detached', 'left', 'removed')),
+  joined_at TIMESTAMPTZ DEFAULT NOW(),
+  left_at TIMESTAMPTZ,
+  UNIQUE(room_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_room_members_room ON room_members(room_id);
+CREATE INDEX IF NOT EXISTS idx_room_members_user ON room_members(user_id);
+CREATE INDEX IF NOT EXISTS idx_room_members_status ON room_members(status);
+
+-- 10. RLS: rooms
+ALTER TABLE rooms ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Users can view rooms they're in" ON rooms;
+CREATE POLICY "Users can view rooms they're in" ON rooms
+  FOR SELECT TO authenticated
+  USING (
+    auth.uid() = creator_id OR
+    auth.uid() IS NOT NULL
+  );
+
+DROP POLICY IF EXISTS "Authenticated users can create rooms" ON rooms;
+CREATE POLICY "Authenticated users can create rooms" ON rooms
+  FOR INSERT TO authenticated WITH CHECK (true);
+
+DROP POLICY IF EXISTS "Creator can update rooms" ON rooms;
+CREATE POLICY "Creator can update rooms" ON rooms
+  FOR UPDATE TO authenticated
+  USING (auth.uid() = creator_id)
+  WITH CHECK (auth.uid() = creator_id);
+
+DROP POLICY IF EXISTS "Creator can delete rooms" ON rooms;
+CREATE POLICY "Creator can delete rooms" ON rooms
+  FOR DELETE TO authenticated
+  USING (auth.uid() = creator_id);
+
+-- 11. RLS: room_members
+ALTER TABLE room_members ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Users can view room members" ON room_members;
+CREATE POLICY "Users can view room members" ON room_members
+  FOR SELECT USING (
+    auth.uid() = user_id OR
+    auth.uid() IN (SELECT creator_id FROM rooms WHERE id = room_members.room_id) OR
+    auth.uid() IN (SELECT user_id FROM room_members WHERE room_id = room_members.room_id)
+  );
+
+DROP POLICY IF EXISTS "Authenticated users can join rooms" ON room_members;
+CREATE POLICY "Authenticated users can join rooms" ON room_members
+  FOR INSERT TO authenticated WITH CHECK (true);
+
+DROP POLICY IF EXISTS "Users can update their own membership" ON room_members;
+CREATE POLICY "Users can update their own membership" ON room_members
+  FOR UPDATE USING (
+    auth.uid() = user_id OR
+    auth.uid() IN (SELECT creator_id FROM rooms WHERE id = room_members.room_id)
+  );

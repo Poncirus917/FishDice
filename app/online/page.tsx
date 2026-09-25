@@ -5,17 +5,31 @@ import toast from 'react-hot-toast';
 import { supabase } from '../lib/supabase';
 import CharacterManager from './modules/CharacterManager';
 import AvatarCropper from './modules/AvatarCropper';
+import { RoomProvider, useRoom } from './modules/RoomContext';
+import RoomView from './modules/RoomView';
+import { CreateRoomModal } from './modules/CreateRoomModal';
+import { JoinRoomModal } from './modules/JoinRoomModal';
+import { RoomHistorySection } from './modules/RoomHistorySection';
 
-export default function OnlinePage() {
+function OnlinePageContent() {
   const router = useRouter();
   const [userId, setUserId] = useState<string | null>(null);
   const [checking, setChecking] = useState(true);
 
+  const { currentRoom, clearRoom, loadRoom } = useRoom();
+
   // 房间状态
-  const [view, setView] = useState<'lobby' | 'room' | 'characters'|'simulation'>('lobby');
-  const [roomCode, setRoomCode] = useState('');
+  const [view, setView] = useState<'lobby' | 'room' | 'characters'|'simulation'>(() => {
+    if (typeof window !== 'undefined') {
+      const savedRoomId = localStorage.getItem('currentRoomId');
+      return savedRoomId ? 'room' : 'lobby';
+    }
+    return 'lobby';
+  });
   const [joinCode, setJoinCode] = useState('');
-  const [isKP, setIsKP] = useState(false);
+  const [showCreateModal, setShowCreateModal] = useState(false);
+  const [showJoinModal, setShowJoinModal] = useState(false);
+  const [historyRefreshKey, setHistoryRefreshKey] = useState(0);
 
   // 个人信息
   const [displayName, setDisplayName] = useState('');
@@ -42,7 +56,6 @@ export default function OnlinePage() {
       const uid = session.user.id;
       setUserId(uid);
 
-      // 拉取 profile
       const { data: profile } = await supabase
         .from('profiles')
         .select('display_name, avatar_url')
@@ -78,33 +91,16 @@ export default function OnlinePage() {
 
     const getPresenceCount = () => {
       const state = channel.presence.state as Record<string, unknown[]>;
-      const count = Object.values(state).reduce((sum, arr) => sum + (Array.isArray(arr) ? arr.length : 0), 0);
-      console.log('[Realtime] Presence state:', state, 'Count:', count);
-      return count;
+      return Object.values(state).reduce((sum, arr) => sum + (Array.isArray(arr) ? arr.length : 0), 0);
     };
 
-    channel.on('system', {}, (msg) => {
-      console.log('[Realtime] System event:', msg);
-    });
-
     channel
-      .on('presence', { event: 'sync' }, () => {
-        console.log('[Realtime] Presence sync');
-        setOnlineCount(getPresenceCount());
-      })
-      .on('presence', { event: 'join' }, () => {
-        console.log('[Realtime] Presence join');
-        setOnlineCount(getPresenceCount());
-      })
-      .on('presence', { event: 'leave' }, () => {
-        console.log('[Realtime] Presence leave');
-        setOnlineCount(getPresenceCount());
-      })
+      .on('presence', { event: 'sync' }, () => setOnlineCount(getPresenceCount()))
+      .on('presence', { event: 'join' }, () => setOnlineCount(getPresenceCount()))
+      .on('presence', { event: 'leave' }, () => setOnlineCount(getPresenceCount()))
       .subscribe(async (status) => {
-        console.log('[Realtime] Subscribe status:', status);
         if (status === 'SUBSCRIBED') {
           await channel.track({ user_id: userId });
-          console.log('[Realtime] Tracked user:', userId);
           setOnlineCount(getPresenceCount());
         }
       });
@@ -116,13 +112,9 @@ export default function OnlinePage() {
     };
   }, [userId]);
 
-  // 创建房间
+  // 创建房间（KP）
   const handleCreateRoom = () => {
-    const code = Math.floor(1000 + Math.random() * 9000).toString();
-    setRoomCode(code);
-    setIsKP(true);
-    setView('room');
-    toast.success(`房间已创建！房间号：${code}`);
+    setShowCreateModal(true);
   };
 
   // 加入房间
@@ -131,18 +123,50 @@ export default function OnlinePage() {
       toast.error("请输入4位房间号");
       return;
     }
-    setRoomCode(joinCode);
-    setIsKP(false);
-    setView('room');
-    toast.success(`已加入房间：${joinCode}`);
+    setShowJoinModal(true);
   };
 
   // 离开房间
   const handleLeaveRoom = () => {
+    clearRoom();
     setView('lobby');
-    setRoomCode('');
     setJoinCode('');
+    setHistoryRefreshKey(prev => prev + 1);
+    localStorage.removeItem('currentRoomId');
   };
+
+  // 进入房间（支持从历史记录进入，needJoin 表示需要重新选择角色）
+  const handleEnterRoom = (info?: { roomId?: string; roomCode?: string; needJoin?: boolean }) => {
+    if (info?.needJoin) {
+      setJoinCode(info.roomCode || '');
+      setShowJoinModal(true);
+    } else {
+      // 优先使用 currentRoom（如果已通过 loadRoom 加载），否则使用 info 中的 roomId
+      const roomId = currentRoom?.id || info?.roomId;
+      if (roomId) {
+        localStorage.setItem('currentRoomId', roomId);
+      }
+      setView('room');
+    }
+  };
+
+  // 恢复上次的房间
+  useEffect(() => {
+    if (checking) return;
+    if (view === 'room' && !currentRoom && userId) {
+      const savedRoomId = localStorage.getItem('currentRoomId');
+      if (savedRoomId) {
+        loadRoom(savedRoomId).then(() => {
+          setView('room');
+        }).catch(() => {
+          setView('lobby');
+          localStorage.removeItem('currentRoomId');
+        });
+      } else {
+        setView('lobby');
+      }
+    }
+  }, [view, currentRoom, userId, checking, loadRoom]);
 
   // 退出登录
   const handleLogout = async () => {
@@ -191,7 +215,6 @@ export default function OnlinePage() {
     if (!userId) return;
     setSavingProfile(true);
     try {
-      // 更新用户名
       const { error: nameError } = await supabase
         .from('profiles')
         .update({ display_name: editName.trim() })
@@ -207,7 +230,6 @@ export default function OnlinePage() {
         return;
       }
 
-      // 如果裁剪了新头像，上传到 Storage
       if (croppedAvatar) {
         const base64Response = await fetch(croppedAvatar);
         const blob = await base64Response.blob();
@@ -280,7 +302,7 @@ export default function OnlinePage() {
   // 在线人数徽章
   const OnlineBadge = () => (
     <div className="flex items-center gap-1.5 px-3 py-1 rounded-full bg-slate-800 border border-slate-700">
-      <span className={`inline-block w-2 h-2 rounded-full bg-emerald-400 animate-pulse`}></span>
+      <span className="inline-block w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
       <span className="text-xs text-slate-400">{Math.max(onlineCount, 1)}</span>
     </div>
   );
@@ -306,14 +328,13 @@ export default function OnlinePage() {
               <h1 className="text-3xl font-bold mb-2">调查员大厅</h1>
               <p className="text-slate-500 text-xl">调查员{displayName}已接入系统。</p>
               <div className="flex items-center justify-center gap-2 mt-2">
-                <span className={`inline-block w-2 h-2 rounded-full ${onlineCount > 0 ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500'}`}></span>
+                <span className="inline-block w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
                 <span className="text-sm text-slate-400">目前共有 {Math.max(onlineCount, 1)} 位调查员在线。</span>
               </div>
             </div>
 
             {/* 第一行：角色管理 + 战斗模拟 */}
             <div className="grid grid-cols-2 gap-10">
-              {/* 角色管理 */}
               <div className="bg-slate-800 rounded-2xl p-8 border border-slate-700 hover:border-cyan-800 transition flex flex-col">
                 <h2 className="font-bold mb-2 flex items-center gap-2 text-lg">
                   <span className="text-2xl">📚</span> 角色管理
@@ -327,7 +348,6 @@ export default function OnlinePage() {
                 </button>
               </div>
 
-              {/* 战斗模拟 */}
               <div className="bg-slate-800 rounded-2xl p-8 border border-slate-700 hover:border-cyan-800 transition flex flex-col">
                 <h2 className="font-bold mb-2 flex items-center gap-2 text-lg">
                   <span className="text-2xl">⚔️</span> 战斗模拟
@@ -344,12 +364,11 @@ export default function OnlinePage() {
 
             {/* 第二行：创建房间 + 加入房间 */}
             <div className="grid grid-cols-2 gap-10">
-              {/* 创建房间 */}
               <div className="bg-slate-800 rounded-2xl p-8 border border-slate-700 hover:border-cyan-800 transition flex flex-col">
                 <h2 className="font-bold mb-2 flex items-center gap-2 text-lg">
                   <span className="text-2xl">🎭</span> 创建房间
                 </h2>
-                <p className="text-slate-400 text-sm mb-6 leading-relaxed flex-1">作为 KP 创建新房间，获得4位房间号分享给玩家</p>
+                <p className="text-slate-400 text-sm mb-6 leading-relaxed flex-1">作为 KP 创建新房间，自定义房间名，获得4位房间号分享给玩家</p>
                 <button
                   onClick={handleCreateRoom}
                   className="w-full py-3 bg-cyan-600 hover:bg-cyan-500 rounded-xl font-bold transition active:scale-[0.98] shadow-lg shadow-cyan-900/30"
@@ -358,7 +377,6 @@ export default function OnlinePage() {
                 </button>
               </div>
 
-              {/* 加入房间 */}
               <div className="bg-slate-800 rounded-2xl p-8 border border-slate-700 hover:border-cyan-800 transition flex flex-col">
                 <h2 className="font-bold mb-2 flex items-center gap-2 text-lg">
                   <span className="text-2xl">🚪</span> 加入房间
@@ -383,6 +401,14 @@ export default function OnlinePage() {
                   </button>
                 </div>
               </div>
+            </div>
+
+            {/* 房间历史 */}
+            <div className="bg-slate-800 rounded-2xl border border-slate-700 p-6">
+              <h2 className="font-bold mb-4 flex items-center gap-2 text-lg">
+                <span className="text-xl">📋</span> 我的房间
+              </h2>
+              <RoomHistorySection userId={userId!} displayName={displayName} onRoomEnter={handleEnterRoom} refreshKey={historyRefreshKey} />
             </div>
           </div>
         </div>
@@ -409,6 +435,22 @@ export default function OnlinePage() {
             size={256}
           />
         )}
+
+        <CreateRoomModal
+          isOpen={showCreateModal}
+          onClose={() => setShowCreateModal(false)}
+          onRoomCreated={() => handleEnterRoom()}
+        />
+
+        <JoinRoomModal
+          isOpen={showJoinModal}
+          roomCode={joinCode}
+          onClose={() => {
+            setShowJoinModal(false);
+            setJoinCode('');
+          }}
+          onRoomEnter={() => handleEnterRoom()}
+        />
       </div>
     );
   }
@@ -513,13 +555,49 @@ export default function OnlinePage() {
 
   // ===================== 战斗模拟视图 =====================
   if (view === 'simulation') {
-    return <DevelopingView title="📚 战斗模拟" onBack={() => setView('lobby')} />;
+    return <DevelopingView title="⚔️ 战斗模拟" onBack={() => setView('lobby')} />;
   }
 
   // ===================== 房间视图 =====================
   if (view === 'room') {
-    return <DevelopingView title={`🎭 房间 ${roomCode}`} onBack={handleLeaveRoom} />;
+    return (
+      <RoomView
+        userId={userId!}
+        displayName={displayName}
+        avatarUrl={avatarUrl}
+        onBackToLobby={handleLeaveRoom}
+      />
+    );
   }
+
+  return null;
+}
+
+// ===================== 主页面组件 =====================
+export default function OnlinePage() {
+  const [userId, setUserId] = useState<string | null>(null);
+
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      if (session) {
+        setUserId(session.user.id);
+      }
+    });
+  }, []);
+
+  if (!userId) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-slate-900">
+        <div className="text-cyan-400 animate-pulse text-sm tracking-widest">LOADING...</div>
+      </div>
+    );
+  }
+
+  return (
+    <RoomProvider userId={userId}>
+      <OnlinePageContent />
+    </RoomProvider>
+  );
 }
 
 // ===================== 个人信息弹窗组件 =====================
@@ -555,7 +633,6 @@ function ProfileModal({
       >
         <h2 className="text-xl font-bold text-center text-cyan-400 mb-6">个人信息</h2>
 
-        {/* 头像 */}
         <div className="flex flex-col items-center mb-6">
           <div className="relative w-20 h-20 rounded-full overflow-hidden border-2 border-slate-600 group cursor-pointer"
             onClick={() => fileInputRef.current?.click()}
@@ -581,7 +658,6 @@ function ProfileModal({
           <p className="text-xs text-slate-500 mt-2">点击头像更换，最大5MB</p>
         </div>
 
-        {/* 用户名 */}
         <div className="mb-6">
           <label className="block text-sm font-medium mb-1.5 text-slate-300">用户名</label>
           <input
@@ -594,7 +670,6 @@ function ProfileModal({
           />
         </div>
 
-        {/* 按钮区 */}
         <div className="space-y-3">
           <button
             onClick={handleSave}
