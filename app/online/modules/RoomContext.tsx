@@ -3,7 +3,8 @@
 import React, { createContext, useContext, useState, useCallback, useRef, useEffect } from 'react';
 import { supabase } from '../../lib/supabase';
 import * as roomService from './roomService';
-import type { Room, RoomWithMembers, RoomListItem, CreateRoomInput } from './roomTypes';
+import type { Room, RoomWithMembers, RoomListItem, CreateRoomInput, DiceLog, PerformCheckInput, PerformCustomInput } from './roomTypes';
+import { cocCheck, rollDiceGroups } from '../../utils/dice';
 
 interface RoomContextType {
   currentRoom: RoomWithMembers | null;
@@ -16,6 +17,7 @@ interface RoomContextType {
   resumeRoom: () => Promise<void>;
   pauseRoom: () => Promise<void>;
   resumeRoomByKP: () => Promise<void>;
+  renameRoom: (name: string) => Promise<void>;
   deleteRoom: () => Promise<void>;
   loadRoom: (roomId: string) => Promise<void>;
   clearRoom: () => void;
@@ -25,6 +27,10 @@ interface RoomContextType {
   broadcastRoomUpdate: (roomId: string, event?: string) => Promise<void>;
   // 大厅房间历史的实时刷新计数（房间暂停/恢复等状态变化时自动递增）
   lobbyRefreshKey: number;
+  // 房间共享掷骰 / 消息流（聊天记录式，实时同步）
+  diceLogs: DiceLog[];
+  performCheck: (input: PerformCheckInput) => Promise<void>;
+  performCustomRoll: (input: PerformCustomInput) => Promise<void>;
 }
 
 const RoomContext = createContext<RoomContextType | null>(null);
@@ -39,6 +45,7 @@ export function RoomProvider({ userId, children }: { userId: string; children: R
   // 用于调试：跟踪最新的 channel 状态
   const channelStatusRef = useRef<string>('uninitialized');
   const [lobbyRefreshKey, setLobbyRefreshKey] = useState(0);
+  const [diceLogs, setDiceLogs] = useState<DiceLog[]>([]);
 
   const setupRoomChannel = useCallback(async (roomId: string) => {
     // 取消旧的 channel
@@ -84,6 +91,19 @@ export function RoomProvider({ userId, children }: { userId: string; children: R
           });
           setCurrentRoom(room);
         }
+      }
+    );
+
+    // 监听 dice_logs 新增（掷骰 / 消息实时同步，聊天记录式追加）
+    // hidden 暗骰行由 RLS 过滤，PL 客户端根本收不到
+    channel.on(
+      'postgres_changes',
+      { event: 'INSERT', schema: 'public', table: 'dice_logs' },
+      (payload) => {
+        const row = (payload as any).new as DiceLog;
+        if (!row || row.room_id !== roomId) return;
+        console.log('[setupRoomChannel] dice_logs INSERT:', { id: row.id, msg_type: row.msg_type });
+        setDiceLogs(prev => (prev.some(l => l.id === row.id) ? prev : [...prev, row]));
       }
     );
 
@@ -174,6 +194,57 @@ export function RoomProvider({ userId, children }: { userId: string; children: R
     }
   }, []);
 
+  // 发起一次 1D100 检定：掷骰者客户端掷骰 → 写 dice_logs → 实时推送给全房。
+  // 阶段2使用默认房规（大成功 ≤3 / 大失败 ≥98）；阶段3房规字段就位后改读房间配置。
+  const performCheck = useCallback(async (input: PerformCheckInput): Promise<void> => {
+    const room = currentRoomRef.current;
+    if (!room) throw new Error('当前不在房间中');
+
+    const result = cocCheck(input.target);
+    await roomService.insertDiceLog({
+      room_id: room.id,
+      user_id: userId,
+      character_id: input.characterId ?? null,
+      char_name: input.charName ?? null,
+      msg_type: input.hidden ? 'hidden' : 'check',
+      label: input.label,
+      roll: result.roll,
+      target: input.target,
+      level: result.level,
+    });
+    // 不需要本地追加：自己的 INSERT 也会通过 Postgres Changes 回推，保持单一数据源
+  }, [userId]);
+
+  // 发起一次自由掷骰：本地按 NdM(+加值) 结算 → 写 dice_logs（msg_type='custom'）→ 实时推送给全房。
+  // level 字段存完整过程明细，与单机版格式一致，如 2D6+1 = 3+2+1 = 6
+  const performCustomRoll = useCallback(async (input: PerformCustomInput): Promise<void> => {
+    const room = currentRoomRef.current;
+    if (!room) throw new Error('当前不在房间中');
+
+    const groups = (input.groups || []).filter(g => g.count >= 1 && g.sides >= 1);
+    if (groups.length === 0) throw new Error('请配置至少一组有效骰子');
+
+    const bonus = input.bonus || 0;
+    const result = rollDiceGroups(groups, bonus);
+
+    const formula = result.parts.map(p => `${p.group.count}D${p.group.sides}`).join('+');
+    const process = result.parts.flatMap(p => p.rolls).join('+');
+    const bonusStr = bonus !== 0 ? `${bonus > 0 ? '+' : ''}${bonus}` : '';
+    const detail = `${formula}${bonusStr} = ${process}${bonusStr} = ${result.total}`;
+
+    await roomService.insertDiceLog({
+      room_id: room.id,
+      user_id: userId,
+      character_id: input.characterId ?? null,
+      char_name: input.charName ?? null,
+      msg_type: 'custom',
+      label: input.label?.trim() || '自由掷骰',
+      roll: result.total,
+      target: null,
+      level: detail,
+    });
+  }, [userId]);
+
   const loadRoom = useCallback(async (roomId: string): Promise<void> => {
     console.log('[loadRoom] 开始加载房间:', roomId);
     setLoading(true);
@@ -201,6 +272,20 @@ export function RoomProvider({ userId, children }: { userId: string; children: R
         setCurrentRoom(room);
         await setupRoomChannel(roomId);
         console.log('[loadRoom] channel 设置完成');
+
+        // 拉取历史掷骰 / 消息日志（订阅建立后再拉，避免漏掉订阅前的瞬间插入；按 id 去重合并）
+        try {
+          const history = await roomService.getDiceLogs(roomId);
+          setDiceLogs(prev => {
+            const map = new Map(prev.map(l => [l.id, l]));
+            history.forEach(l => map.set(l.id, l));
+            return Array.from(map.values()).sort(
+              (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+            );
+          });
+        } catch (logErr) {
+          console.error('[loadRoom] 加载掷骰日志失败:', logErr);
+        }
       } else {
         setError('房间不存在');
       }
@@ -278,6 +363,7 @@ export function RoomProvider({ userId, children }: { userId: string; children: R
       // 广播发送完成后，再清空本地状态
       setCurrentRoom(null);
       currentRoomRef.current = null;
+      setDiceLogs([]);
       console.log('[leaveRoom] 本地状态已清空');
 
       setLoading(false);
@@ -304,6 +390,7 @@ export function RoomProvider({ userId, children }: { userId: string; children: R
       }
       setCurrentRoom(null);
       currentRoomRef.current = null;
+      setDiceLogs([]);
       setLoading(false);
     } catch (err: any) {
       setError(err.message || '暂离房间失败');
@@ -350,6 +437,26 @@ export function RoomProvider({ userId, children }: { userId: string; children: R
     }
   }, [currentRoom]);
 
+  // KP 修改房间名：更新数据库后本地即时改名，并广播 room_update 让房内 PL 重新拉取
+  const renameRoom = useCallback(async (name: string): Promise<void> => {
+    const room = currentRoomRef.current;
+    if (!room) return;
+    const trimmed = name.trim();
+    if (!trimmed) throw new Error('房间名称不能为空');
+    if (trimmed.length > 30) throw new Error('房间名称不能超过30个字');
+
+    setError(null);
+    try {
+      await roomService.renameRoom(room.id, trimmed);
+      setCurrentRoom(prev => prev ? { ...prev, name: trimmed } : null);
+      // 房内 PL 不订阅 rooms 表变更，通过广播触发其 getRoom 刷新
+      await broadcastRoomUpdate(room.id);
+    } catch (err: any) {
+      setError(err.message || '房间名更新失败');
+      throw err;
+    }
+  }, [broadcastRoomUpdate]);
+
   const deleteRoom = useCallback(async (): Promise<void> => {
     if (!currentRoom) return;
     setLoading(true);
@@ -365,6 +472,7 @@ export function RoomProvider({ userId, children }: { userId: string; children: R
       await roomService.deleteRoom(currentRoom.id);
       setCurrentRoom(null);
       currentRoomRef.current = null;
+      setDiceLogs([]);
       setLoading(false);
     } catch (err: any) {
       setError(err.message || '删除房间失败');
@@ -380,6 +488,7 @@ export function RoomProvider({ userId, children }: { userId: string; children: R
     }
     setCurrentRoom(null);
     currentRoomRef.current = null;
+    setDiceLogs([]);
   }, []);
 
   // 大厅实时订阅：监听 rooms 表 UPDATE（如 KP 进入暂停房间后自动恢复 active），
@@ -399,10 +508,12 @@ export function RoomProvider({ userId, children }: { userId: string; children: R
           roomId: newRow?.id,
           oldStatus: oldRow?.status,
           newStatus: newRow?.status,
+          oldName: oldRow?.name,
+          newName: newRow?.name,
         });
 
-        // 仅在房间状态（active/paused）真正变化时刷新，避免其他字段更新引起无谓刷新
-        if (newRow?.status !== oldRow?.status) {
+        // 房间状态（active/paused）或房间名变化时刷新大厅列表（如 KP 改名）
+        if (newRow?.status !== oldRow?.status || newRow?.name !== oldRow?.name) {
           setLobbyRefreshKey(k => k + 1);
         }
       }
@@ -467,6 +578,7 @@ export function RoomProvider({ userId, children }: { userId: string; children: R
     resumeRoom: async () => {},
     pauseRoom,
     resumeRoomByKP,
+    renameRoom,
     deleteRoom,
     loadRoom,
     clearRoom,
@@ -475,6 +587,9 @@ export function RoomProvider({ userId, children }: { userId: string; children: R
     broadcastMemberRemoved,
     broadcastRoomUpdate,
     lobbyRefreshKey,
+    diceLogs,
+    performCheck,
+    performCustomRoll,
   };
 
   return <RoomContext.Provider value={value}>{children}</RoomContext.Provider>;

@@ -148,6 +148,9 @@ CREATE INDEX IF NOT EXISTS idx_rooms_creator ON rooms(creator_id);
 CREATE INDEX IF NOT EXISTS idx_rooms_status ON rooms(status);
 CREATE INDEX IF NOT EXISTS idx_rooms_code ON rooms(room_code);
 
+-- Realtime 要求：UPDATE 事件需完整旧行（改名/暂停后客户端需对比 old/new 的 name、status）
+ALTER TABLE rooms REPLICA IDENTITY FULL;
+
 -- 9. room_members 表（房间成员）
 CREATE TABLE IF NOT EXISTS room_members (
   id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
@@ -212,3 +215,97 @@ CREATE POLICY "Users can update their own membership" ON room_members
     auth.uid() = user_id OR
     auth.uid() IN (SELECT creator_id FROM rooms WHERE id = room_members.room_id)
   );
+
+-- ============================================
+-- 12. dice_logs 表（房间共享掷骰 / 消息流，类似聊天记录）
+-- ============================================
+-- msg_type 说明：
+--   check   明骰：1D100 技能/属性检定，全房可见
+--   custom  明骰：自由掷骰（阶段3）
+--   damage  数值变化日志（阶段3）
+--   hidden  暗骰：仅 KP（房间创建者）可读取内容，PL 端只见"KP 进行了暗骰"提示（阶段3）
+--   request KP 请求掷骰的系统消息（阶段4）
+--   note    剧情笔记 / 文字记录
+--   status  状态变更（重伤、疯狂等）
+CREATE TABLE IF NOT EXISTS dice_logs (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  room_id UUID REFERENCES rooms(id) ON DELETE CASCADE NOT NULL,
+  user_id UUID REFERENCES auth.users(id) NOT NULL,
+  character_id TEXT,
+  char_name TEXT,
+  msg_type TEXT NOT NULL CHECK (msg_type IN ('check', 'custom', 'damage', 'hidden', 'request', 'note', 'status')),
+  label TEXT NOT NULL DEFAULT '',
+  roll INTEGER,
+  target INTEGER,
+  level TEXT,
+  payload JSONB,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_dice_logs_room ON dice_logs(room_id, created_at);
+
+-- Realtime 要求：UPDATE/DELETE 事件需完整旧行（INSERT 不依赖，先为后续阶段备好）
+ALTER TABLE dice_logs REPLICA IDENTITY FULL;
+
+-- 辅助函数：SECURITY DEFINER 以属主身份执行、绕过 RLS，
+-- 供其它表（如 dice_logs）的策略调用，避免 room_members 自引用策略导致无限递归
+CREATE OR REPLACE FUNCTION public.is_room_member(p_room_id UUID, p_user_id UUID)
+RETURNS BOOLEAN
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
+AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM public.room_members
+    WHERE room_id = p_room_id AND user_id = p_user_id
+  );
+$$;
+
+CREATE OR REPLACE FUNCTION public.is_room_creator(p_room_id UUID, p_user_id UUID)
+RETURNS BOOLEAN
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
+AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM public.rooms
+    WHERE id = p_room_id AND creator_id = p_user_id
+  );
+$$;
+
+-- RLS: dice_logs
+ALTER TABLE dice_logs ENABLE ROW LEVEL SECURITY;
+
+-- 读取：房间成员可读；hidden 暗骰行只有 KP（创建者）能读，
+-- Postgres Changes 同样遵守 RLS，因此暗骰 INSERT 不会推送到 PL 客户端
+DROP POLICY IF EXISTS "Room members can read dice logs" ON dice_logs;
+CREATE POLICY "Room members can read dice logs" ON dice_logs
+  FOR SELECT TO authenticated
+  USING (
+    (public.is_room_creator(room_id, auth.uid()) OR public.is_room_member(room_id, auth.uid()))
+    AND (msg_type <> 'hidden' OR public.is_room_creator(room_id, auth.uid()))
+  );
+
+-- 写入：房间成员可写；hidden 暗骰只允许 KP 写入
+DROP POLICY IF EXISTS "Room members can insert dice logs" ON dice_logs;
+CREATE POLICY "Room members can insert dice logs" ON dice_logs
+  FOR INSERT TO authenticated
+  WITH CHECK (
+    (public.is_room_creator(room_id, auth.uid()) OR public.is_room_member(room_id, auth.uid()))
+    AND (msg_type <> 'hidden' OR public.is_room_creator(room_id, auth.uid()))
+  );
+
+-- 更新：作者本人或 KP
+DROP POLICY IF EXISTS "Author or KP can update dice logs" ON dice_logs;
+CREATE POLICY "Author or KP can update dice logs" ON dice_logs
+  FOR UPDATE TO authenticated
+  USING (user_id = auth.uid() OR public.is_room_creator(room_id, auth.uid()));
+
+-- 删除：作者本人或 KP（为后续"删除单条日志"预留）
+DROP POLICY IF EXISTS "Author or KP can delete dice logs" ON dice_logs;
+CREATE POLICY "Author or KP can delete dice logs" ON dice_logs
+  FOR DELETE TO authenticated
+  USING (user_id = auth.uid() OR public.is_room_creator(room_id, auth.uid()));
+
+-- 加入 Realtime 发布（幂等：重复执行不报错）
+DO $$
+BEGIN
+  ALTER PUBLICATION supabase_realtime ADD TABLE public.dice_logs;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;

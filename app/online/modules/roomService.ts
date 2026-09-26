@@ -1,5 +1,5 @@
 import { supabase } from '../../lib/supabase';
-import type { Room, RoomWithMembers, RoomListItem, CreateRoomInput } from './roomTypes';
+import type { Room, RoomWithMembers, RoomListItem, CreateRoomInput, DiceLog, DiceLogInsert } from './roomTypes';
 
 // 获取房间信息（包含成员列表）
 export const getRoom = async (roomId: string): Promise<RoomWithMembers | null> => {
@@ -105,6 +105,20 @@ export const createRoom = async (creatorId: string, input: CreateRoomInput): Pro
   if (memberError) throw new Error(memberError.message);
 
   return data;
+};
+
+// KP 修改房间名（RLS 仅允许 creator_id 本人更新，用 .select() 校验确实更新了行）
+export const renameRoom = async (roomId: string, name: string): Promise<void> => {
+  const { data, error } = await supabase
+    .from('rooms')
+    .update({ name, updated_at: new Date().toISOString() })
+    .eq('id', roomId)
+    .select();
+
+  if (error) throw new Error(error.message);
+  if (!data || data.length === 0) {
+    throw new Error('房间名更新失败，可能没有操作权限');
+  }
 };
 
 // 加入房间
@@ -407,4 +421,44 @@ export const getCharacterKP = async (characterId: string): Promise<{ kp_id: stri
 
   if (error || !data) return null;
   return data;
+};
+
+// ---------- 掷骰 / 共享消息流 ----------
+
+// 写入一条掷骰 / 消息日志（写入后由 Postgres Changes 实时推送给房间内其他客户端）
+export const insertDiceLog = async (input: DiceLogInsert): Promise<DiceLog> => {
+  const { data, error } = await supabase
+    .from('dice_logs')
+    .insert({
+      room_id: input.room_id,
+      user_id: input.user_id,
+      character_id: input.character_id ?? null,
+      char_name: input.char_name ?? null,
+      msg_type: input.msg_type,
+      label: input.label,
+      roll: input.roll ?? null,
+      target: input.target ?? null,
+      level: input.level ?? null,
+      payload: input.payload ?? null,
+    })
+    .select()
+    .single();
+
+  if (error) throw new Error(error.message);
+  if (!data) throw new Error('写入掷骰日志失败');
+  return data as DiceLog;
+};
+
+// 读取房间最近的掷骰 / 消息日志（按时间正序，便于像聊天记录一样从旧到新展示）
+// hidden 暗骰行由 RLS 自动处理：PL 的查询结果中不包含，KP 正常返回
+export const getDiceLogs = async (roomId: string, limit: number = 200): Promise<DiceLog[]> => {
+  const { data, error } = await supabase
+    .from('dice_logs')
+    .select('*')
+    .eq('room_id', roomId)
+    .order('created_at', { ascending: true })
+    .limit(limit);
+
+  if (error) throw new Error(error.message);
+  return (data || []) as DiceLog[];
 };

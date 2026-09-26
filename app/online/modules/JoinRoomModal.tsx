@@ -165,11 +165,11 @@ export function JoinRoomModal({ isOpen, roomCode, onClose, onRoomEnter }: JoinRo
         ? `你即将以 KP 身份进入房间「${roomInfo?.name}」\n\n确定加入吗？`
         : memberStatus === 'detached'
           ? `你将使用原有角色「${characterName}」加入房间「${roomInfo?.name}」\n\n确定加入吗？`
-          : `你即将以角色「${characterName}」加入房间「${roomInfo?.name}」\n\n确定加入吗？`,
+          : `你即将以角色「${characterName}」加入房间「${roomInfo?.name}」\n\n角色选定后无法更改，确定加入吗？`,
       confirmText: '确认加入',
       confirmColor: '#0891b2',
       // 仅首次加入的新成员需要 5 秒冷静期；非首次加入（暂离返回/退出后重选角色）无需等待
-      countdownSeconds: memberStatus === null ? 5 : 0,
+      //countdownSeconds: memberStatus === null ? 5 : 0,
       onConfirm: async () => {
         setSubmitting(true);
         try {

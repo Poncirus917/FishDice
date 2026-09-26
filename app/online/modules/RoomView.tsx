@@ -1,10 +1,11 @@
 "use client";
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import toast from 'react-hot-toast';
 import { useRoom } from './RoomContext';
 import { useConfirmDialog } from './ConfirmDialog';
 import { supabase } from '../../lib/supabase';
+import type { DiceGroup } from '../../utils/dice';
 import type { CharacterState } from '../../(single)/page';
 
 interface RoomViewProps {
@@ -15,12 +16,27 @@ interface RoomViewProps {
 }
 
 export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby }: RoomViewProps) {
-  const { currentRoom, loading, pauseRoom, deleteRoom, leaveRoom, detachFromRoom, loadRoom, broadcastMemberRemoved } = useRoom();
+  const { currentRoom, loading, pauseRoom, deleteRoom, leaveRoom, detachFromRoom, loadRoom, renameRoom, broadcastMemberRemoved, diceLogs, performCheck, performCustomRoll } = useRoom();
   const { showConfirm, Dialog } = useConfirmDialog();
   const [allCharacters, setAllCharacters] = useState<Record<string, CharacterState>>({});
   const [myCharacterId, setMyCharacterId] = useState<string | null>(null);
   const [manageMembersModal, setManageMembersModal] = useState(false);
   const [selectedMembers, setSelectedMembers] = useState<string[]>([]);
+  // KP 修改房间名
+  const [renameModalOpen, setRenameModalOpen] = useState(false);
+  const [renameValue, setRenameValue] = useState('');
+  const [renameSubmitting, setRenameSubmitting] = useState(false);
+
+  // 掷骰面板
+  const [rollTab, setRollTab] = useState<'check' | 'custom'>('check');
+  const [checkLabel, setCheckLabel] = useState('');
+  const [checkTarget, setCheckTarget] = useState<number | ''>('');
+  const [selectedNpcId, setSelectedNpcId] = useState<string>('');
+  // 自由掷骰
+  const [freeLabel, setFreeLabel] = useState('');
+  const [freeDiceGroups, setFreeDiceGroups] = useState<DiceGroup[]>([{ count: 1, sides: 6 }]);
+  const [freeBonus, setFreeBonus] = useState<number>(0);
+  const logListRef = useRef<HTMLDivElement>(null);
 
   // 调试日志
   useEffect(() => {
@@ -112,6 +128,119 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
       setMyCharacterId(myMembership.character_id);
     }
   }, [myMembership]);
+
+  // 新日志到达时自动滚动到底部（像聊天软件一样跟随最新消息）
+  useEffect(() => {
+    const el = logListRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [diceLogs]);
+
+  // KP 可代掷的角色：房间内已加载的 NPC / 怪物（allCharacters 按 data.id 与 db id 双 key 存储，需按 c.id 去重）
+  const npcOptions = Object.values(allCharacters).reduce<CharacterState[]>((acc, c) => {
+    if ((c.type === 'npc' || c.type === 'mob') && !acc.some(x => x.id === c.id)) acc.push(c);
+    return acc;
+  }, []);
+  const kpCanCheck = npcOptions.length > 0;
+
+  // KP 没有可代掷角色时自动切到自由掷骰页签（检定行为必须绑定角色）
+  useEffect(() => {
+    if (isCreator && npcOptions.length === 0) setRollTab('custom');
+  }, [isCreator, npcOptions.length]);
+
+  // 检定：手动填写检定项目与目标值发起 1D100；KP 必须选定代掷的 NPC/怪物
+  const handlePerformCheck = async () => {
+    const label = checkLabel.trim();
+    const target = checkTarget === '' ? NaN : Number(checkTarget);
+
+    if (!label) {
+      toast('请填写检定项目（如：侦查）');
+      return;
+    }
+    if (!Number.isFinite(target) || target <= 0) {
+      toast('请填写有效的目标值');
+      return;
+    }
+
+    try {
+      if (isCreator) {
+        const npc = npcOptions.find(c => c.id === selectedNpcId) || npcOptions[0];
+        if (!npc) {
+          toast('没有可代掷的 NPC/怪物，请使用自由掷骰');
+          return;
+        }
+        await performCheck({ label, target, characterId: npc.id, charName: npc.name });
+      } else {
+        const myChar = myCharacterId ? allCharacters[myCharacterId] : null;
+        await performCheck({
+          label,
+          target,
+          characterId: myCharacterId,
+          charName: myChar?.name || displayName,
+        });
+      }
+      setCheckLabel('');
+      setCheckTarget('');
+    } catch (err: any) {
+      toast.error(err.message || '掷骰失败');
+    }
+  };
+
+  // 自由掷骰：NdM 多组骰子 + 加值（KP 无角色时的唯一掷骰方式）
+  const handleFreeRoll = async () => {
+    const validGroups = freeDiceGroups.filter(g => g.count >= 1 && g.sides >= 1);
+    if (validGroups.length === 0) {
+      toast('请配置至少一组有效骰子');
+      return;
+    }
+
+    try {
+      if (isCreator) {
+        await performCustomRoll({ label: freeLabel, groups: validGroups, bonus: freeBonus, charName: '守秘人' });
+      } else {
+        const myChar = myCharacterId ? allCharacters[myCharacterId] : null;
+        await performCustomRoll({
+          label: freeLabel,
+          groups: validGroups,
+          bonus: freeBonus,
+          characterId: myCharacterId,
+          charName: myChar?.name || displayName,
+        });
+      }
+      setFreeLabel('');
+      setFreeBonus(0);
+      setFreeDiceGroups([{ count: 1, sides: 6 }]);
+    } catch (err: any) {
+      toast.error(err.message || '掷骰失败');
+    }
+  };
+
+  // 更新自由掷骰的骰子组
+  const updateFreeGroup = (index: number, field: keyof DiceGroup, value: number) => {
+    setFreeDiceGroups(prev => {
+      const next = [...prev];
+      next[index] = { ...next[index], [field]: Math.max(1, value) };
+      return next;
+    });
+  };
+  const addFreeGroup = () => {
+    setFreeDiceGroups(prev => (prev.length < 3 ? [...prev, { count: 1, sides: 6 }] : prev));
+  };
+  const removeFreeGroup = (index: number) => {
+    setFreeDiceGroups(prev => prev.filter((_, i) => i !== index));
+  };
+
+  // 检定等级 → 颜色
+  const getLevelClass = (level: string | null) => {
+    if (!level) return 'text-slate-300';
+    if (level === '大成功') return 'text-emerald-300';
+    if (level.includes('成功')) return 'text-green-400';
+    if (level === '大失败') return 'text-red-300';
+    return 'text-red-400';
+  };
+
+  // 格式化日志时间
+  const formatLogTime = (iso: string) =>
+    new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 
   // 监听被踢出房间的事件
   useEffect(() => {
@@ -220,6 +349,46 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
         }
       },
     });
+  };
+
+  // 打开改名弹窗：用当前房间名预填
+  const handleOpenRename = () => {
+    setRenameValue(currentRoom.name);
+    setRenameModalOpen(true);
+  };
+
+  const handleCloseRename = () => {
+    if (renameSubmitting) return;
+    setRenameModalOpen(false);
+    setRenameValue('');
+  };
+
+  const handleRenameSubmit = async () => {
+    const trimmed = renameValue.trim();
+    if (!trimmed) {
+      toast('请输入房间名称');
+      return;
+    }
+    if (trimmed.length > 30) {
+      toast.error('房间名称不能超过30个字');
+      return;
+    }
+    if (trimmed === currentRoom.name) {
+      handleCloseRename();
+      return;
+    }
+
+    setRenameSubmitting(true);
+    try {
+      await renameRoom(trimmed);
+      toast.success('房间名已修改');
+      setRenameModalOpen(false);
+      setRenameValue('');
+    } catch (err: any) {
+      toast.error(err.message || '修改失败');
+    } finally {
+      setRenameSubmitting(false);
+    }
   };
 
   const handleDeleteRoom = () => {
@@ -532,7 +701,17 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
         <header className="flex justify-between items-center px-6 py-4 border-b border-slate-800 bg-slate-900">
           <div className="flex items-center gap-2">
             <span className="text-xl">🎭</span>
-            <span className="font-bold text-lg">{currentRoom.name}</span>
+            {isCreator ? (
+              <button
+                onClick={handleOpenRename}
+                title="点击修改房间名"
+                className="font-bold text-lg hover:text-cyan-400 transition cursor-pointer underline-offset-4 hover:underline decoration-dotted decoration-slate-600"
+              >
+                {currentRoom.name}
+              </button>
+            ) : (
+              <span className="font-bold text-lg">{currentRoom.name}</span>
+            )}
             {paused && (
               <span className="px-2 py-0.5 bg-amber-600 text-xs rounded-full">已暂停</span>
             )}
@@ -582,14 +761,322 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
           </div>
         </header>
 
-        {/* 主内容 */}
-        <main className="flex-1 overflow-y-auto p-6">
-          <div className="max-w-4xl mx-auto space-y-6">
-          </div>
-        </main>
+        {/* 主内容：掷骰面板 + 共享日志流 */}
+        <div className="flex-1 flex min-h-0">
+          <main className="flex-1 overflow-y-auto p-8">
+            <div className="max-w-xl mx-auto">
+              <div className="rounded-2xl bg-slate-800/60 border border-slate-700 p-6 space-y-5">
+                {/* 页签切换 */}
+                <div className="flex gap-1 p-1 bg-slate-900/60 rounded-xl">
+                  <button
+                    onClick={() => setRollTab('check')}
+                    disabled={isCreator && !kpCanCheck}
+                    className={`flex-1 py-2 rounded-lg text-xs font-bold transition ${
+                      rollTab === 'check'
+                        ? 'bg-cyan-600 text-white'
+                        : 'text-slate-400 hover:text-slate-200'
+                    } ${isCreator && !kpCanCheck ? 'opacity-40 cursor-not-allowed' : ''}`}
+                  >
+                    🎯 技能检定
+                  </button>
+                  <button
+                    onClick={() => setRollTab('custom')}
+                    className={`flex-1 py-2 rounded-lg text-xs font-bold transition ${
+                      rollTab === 'custom'
+                        ? 'bg-cyan-600 text-white'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    🎲 自由掷骰
+                  </button>
+                </div>
+
+                {rollTab === 'check' && (
+                  <>
+                    <div>
+                      <h3 className="text-base font-bold flex items-center gap-2">
+                        <span>🎯</span> 技能 / 属性检定
+                      </h3>
+                      {isCreator ? (
+                        <div className="mt-2.5 space-y-2">
+                          <p className="text-xs text-slate-500">选择代掷角色：</p>
+                          <select
+                            value={selectedNpcId || npcOptions[0]?.id || ''}
+                            onChange={e => setSelectedNpcId(e.target.value)}
+                            className="w-full bg-slate-900/70 border border-slate-700 rounded-xl px-3 py-2.5 text-sm outline-none focus:border-cyan-500"
+                          >
+                            {npcOptions.map(c => (
+                              <option key={c.id} value={c.id}>
+                                {c.type === 'mob' ? '怪物·' : 'NPC·'}{c.name}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                      ) : (
+                        <p className="text-xs text-slate-500 mt-1.5">
+                          掷骰角色：
+                          <span className="text-cyan-400 font-bold">
+                            {(myCharacterId && allCharacters[myCharacterId]?.name) || '未选择角色'}
+                          </span>
+                        </p>
+                      )}
+                    </div>
+
+                    <div className="space-y-3">
+                      <input
+                        type="text"
+                        placeholder="检定项目，如：侦查"
+                        className="w-full bg-slate-900/70 border border-slate-700 rounded-xl px-4 py-3 text-sm outline-none focus:border-cyan-500 transition"
+                        value={checkLabel}
+                        onChange={e => setCheckLabel(e.target.value)}
+                        onKeyDown={e => { if (e.key === 'Enter') handlePerformCheck(); }}
+                      />
+                      <input
+                        type="number"
+                        min={1}
+                        max={100}
+                        placeholder="目标值，如：60"
+                        className="w-full bg-slate-900/70 border border-slate-700 rounded-xl px-4 py-3 text-sm outline-none focus:border-cyan-500 transition"
+                        value={checkTarget}
+                        onChange={e => setCheckTarget(e.target.value === '' ? '' : Number(e.target.value))}
+                        onKeyDown={e => { if (e.key === 'Enter') handlePerformCheck(); }}
+                      />
+                    </div>
+
+                    <button
+                      onClick={handlePerformCheck}
+                      className="w-full py-3 rounded-xl bg-cyan-600 hover:bg-cyan-500 font-bold text-sm transition active:scale-[0.99]"
+                    >
+                      掷 1D100
+                    </button>
+                  </>
+                )}
+
+                {rollTab === 'custom' && (
+                  <>
+                    <div>
+                      <h3 className="text-base font-bold flex items-center gap-2">
+                        <span>🎲</span> 自由掷骰
+                      </h3>
+                      <p className="text-xs text-slate-500 mt-1.5">
+                        {isCreator
+                          ? '守秘人身份掷骰，无需绑定角色'
+                          : '以当前角色身份掷骰，结果全房可见'}
+                      </p>
+                    </div>
+
+                    <input
+                      type="text"
+                      placeholder="掷骰目的（可选），如：先攻 / 敌人数目"
+                      className="w-full bg-slate-900/70 border border-slate-700 rounded-xl px-4 py-3 text-sm outline-none focus:border-cyan-500 transition"
+                      value={freeLabel}
+                      onChange={e => setFreeLabel(e.target.value)}
+                    />
+
+                    {/* 骰子组配置 */}
+                    <div className="space-y-2">
+                      <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest">
+                        掷骰组合
+                      </label>
+                      {freeDiceGroups.map((group, index) => (
+                        <div key={index} className="flex items-center gap-2">
+                          <input
+                            type="number"
+                            min={1}
+                            className="w-full h-11 text-center text-base font-black bg-slate-900/70 border border-slate-700 rounded-xl outline-none focus:border-cyan-500"
+                            value={group.count}
+                            onChange={e => updateFreeGroup(index, 'count', Number(e.target.value))}
+                          />
+                          <span className="font-serif italic text-base text-slate-500">D</span>
+                          <input
+                            type="number"
+                            min={1}
+                            className="w-full h-11 text-center text-base font-black bg-slate-900/70 border border-slate-700 rounded-xl outline-none focus:border-cyan-500"
+                            value={group.sides}
+                            onChange={e => updateFreeGroup(index, 'sides', Number(e.target.value))}
+                            onKeyDown={e => { if (e.key === 'Enter') handleFreeRoll(); }}
+                          />
+                          {freeDiceGroups.length > 1 && (
+                            <button
+                              onClick={() => removeFreeGroup(index)}
+                              className="text-slate-500 hover:text-red-400 px-1 text-sm"
+                            >
+                              ✕
+                            </button>
+                          )}
+                        </div>
+                      ))}
+                      {freeDiceGroups.length < 3 && (
+                        <button
+                          onClick={addFreeGroup}
+                          className="w-full py-1.5 border border-dashed border-slate-700 rounded-xl text-slate-500 text-[10px] font-bold uppercase hover:bg-slate-900/40"
+                        >
+                          + 添加骰子组
+                        </button>
+                      )}
+                    </div>
+
+                    <div>
+                      <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest">
+                        额外加值 Bonus
+                      </label>
+                      <input
+                        type="number"
+                        className="mt-1.5 w-full h-11 px-4 text-base font-black bg-slate-900/70 border border-slate-700 rounded-xl outline-none focus:border-cyan-500"
+                        value={freeBonus}
+                        onChange={e => setFreeBonus(e.target.value === '' ? 0 : Number(e.target.value))}
+                        onKeyDown={e => { if (e.key === 'Enter') handleFreeRoll(); }}
+                      />
+                    </div>
+
+                    <button
+                      onClick={handleFreeRoll}
+                      className="w-full py-3 rounded-xl bg-cyan-600 hover:bg-cyan-500 font-bold text-sm transition active:scale-[0.99]"
+                    >
+                      掷骰
+                    </button>
+                  </>
+                )}
+              </div>
+
+              {isCreator && !kpCanCheck && (
+                <p className="text-[11px] text-amber-500/70 text-center mt-4 leading-relaxed">
+                  检定类掷骰必须绑定角色。导入 NPC / 怪物并加入房间后，
+                  即可在「技能检定」中选择代掷对象。
+                </p>
+              )}
+            </div>
+          </main>
+
+          {/* 共享掷骰 / 消息日志（聊天记录式） */}
+          <aside className="w-96 flex-shrink-0 border-l border-slate-700 bg-slate-800/40 flex flex-col">
+            <div className="px-4 py-3 border-b border-slate-700 flex items-center gap-2">
+              <span>📜</span>
+              <span className="font-bold text-sm">掷骰记录</span>
+              <span className="text-xs text-slate-500 ml-auto">{diceLogs.length}</span>
+            </div>
+
+            <div ref={logListRef} className="flex-1 overflow-y-auto p-4 space-y-4">
+              {diceLogs.length === 0 && (
+                <p className="text-center text-slate-600 text-xs py-10 italic">
+                  暂无掷骰记录，等待第一掷…
+                </p>
+              )}
+
+              {diceLogs.map(log => {
+                const sender = currentRoom.members.find(m => m.user_id === log.user_id);
+                const senderName = isCreator && log.user_id === currentRoom.creator_id
+                  ? '守秘人'
+                  : (log.char_name || sender?.profile?.display_name || '未知');
+                const isCheckType = log.msg_type === 'check' || log.msg_type === 'hidden';
+
+                return (
+                  <div key={log.id} className="flex gap-3">
+                    <div className="w-9 h-9 rounded-full bg-slate-700 flex items-center justify-center text-xs font-bold flex-shrink-0 overflow-hidden">
+                      {sender?.profile?.avatar_url ? (
+                        <img src={sender.profile.avatar_url} alt="" className="w-full h-full object-cover" />
+                      ) : (
+                        <span>{senderName[0]}</span>
+                      )}
+                    </div>
+
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs font-bold text-slate-200 truncate">{senderName}</span>
+                        {log.msg_type === 'hidden' && (
+                          <span className="px-1.5 py-0.5 bg-purple-600/80 rounded text-[9px] font-bold">暗骰</span>
+                        )}
+                        <span className="text-[10px] text-slate-500 ml-auto flex-shrink-0">
+                          {formatLogTime(log.created_at)}
+                        </span>
+                      </div>
+
+                      <div className="mt-1.5 rounded-xl bg-slate-700/50 px-3.5 py-3">
+                        {isCheckType && log.roll !== null ? (
+                          <>
+                            <div className="flex items-baseline gap-2 flex-wrap">
+                              <span className="text-slate-300 text-sm">{log.label}</span>
+                              <span className="text-xl font-black text-white">{log.roll}</span>
+                              <span className="text-xs text-slate-400">/ {log.target}</span>
+                            </div>
+                            <div className={`text-xs font-black mt-1.5 ${getLevelClass(log.level)}`}>
+                              {log.level}
+                            </div>
+                          </>
+                        ) : log.msg_type === 'custom' ? (
+                          <>
+                            <div className="flex items-baseline gap-2">
+                              <span className="text-slate-300 text-sm">{log.label}</span>
+                              <span className="text-xl font-black text-cyan-300 ml-auto">{log.roll}</span>
+                            </div>
+                            <div className="text-[11px] text-slate-400 font-mono mt-1 break-all">
+                              {log.level}
+                            </div>
+                          </>
+                        ) : (
+                          <span className="text-sm text-slate-300">{log.label || log.level}</span>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </aside>
+        </div>
       </div>
 
       {Dialog}
+
+      {/* KP 修改房间名弹窗 */}
+      {renameModalOpen && (
+        <div
+          className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-900/60 backdrop-blur-sm p-4"
+          onClick={handleCloseRename}
+        >
+          <div
+            className="w-full max-w-md bg-slate-800 rounded-2xl shadow-2xl border border-slate-700 p-6"
+            onClick={e => e.stopPropagation()}
+          >
+            <h2 className="text-xl font-bold text-center text-cyan-400 mb-6">修改房间名</h2>
+
+            <div className="mb-6">
+              <label className="block text-sm font-medium mb-2 text-slate-300">房间名称</label>
+              <input
+                type="text"
+                value={renameValue}
+                onChange={e => setRenameValue(e.target.value)}
+                maxLength={30}
+                disabled={renameSubmitting}
+                onKeyDown={e => { if (e.key === 'Enter') handleRenameSubmit(); }}
+                className="w-full p-3 rounded-xl bg-slate-900 border border-slate-700 focus:border-cyan-500 outline-none text-white transition disabled:opacity-60"
+                placeholder="输入房间名称（30字以内）"
+                autoFocus
+              />
+              <p className="text-xs text-slate-500 mt-1 text-right">
+                {renameValue.length}/30
+              </p>
+            </div>
+
+            <div className="space-y-3">
+              <button
+                onClick={handleRenameSubmit}
+                disabled={renameSubmitting || !renameValue.trim()}
+                className="w-full py-3 bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 disabled:cursor-not-allowed rounded-xl font-bold transition shadow-lg shadow-cyan-900/30"
+              >
+                {renameSubmitting ? '保存中...' : '保存'}
+              </button>
+              <button
+                onClick={handleCloseRename}
+                disabled={renameSubmitting}
+                className="w-full py-2 text-slate-400 hover:text-slate-200 text-sm transition"
+              >
+                取消
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* 管理成员弹窗 */}
       {manageMembersModal && (
