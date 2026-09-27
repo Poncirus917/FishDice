@@ -369,7 +369,7 @@ export function JoinRoomModal({ isOpen, roomCode, onClose, onRoomEnter }: JoinRo
                           <div className="flex-1">
                             <div className="font-bold text-white text-sm">{char.name}</div>
                             <div className="text-xs text-slate-500">
-                              HP: {char.hp.current}/{char.hp.max} · 敏捷: {char.attributes['敏捷']}
+                              HP: {char.hp.current}/{char.hp.max} · MP: {char.mp.current}/{char.mp.max}
                             </div>
                           </div>
                           {selectedCharacterId === char.id && (
