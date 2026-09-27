@@ -1172,8 +1172,12 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
           </div>
         </header>
 
-        {/* 主内容区：上部空间暂留作他用 */}
-        <div className="flex-1 min-h-0" />
+        {/* 主内容区：掷骰功能开发中提示（底部留白避开悬浮掷骰面板，使其在可见区居中） */}
+        <div className="flex-1 min-h-0 flex items-center justify-center pb-[calc(33vh+1rem)]">
+          <span className="text-slate-600 text-lg tracking-[0.3em] font-bold select-none">
+            掷骰功能仍在开发中，下方简易掷骰仅作简单测试用，不代表最终效果
+          </span>
+        </div>
 
         {/* 底部掷骰面板（悬浮窗）：贴页面下方、避开左侧角色栏（w-80）、高约 1/3；内容单行排布，不做内部滚动 */}
         <div className="fixed left-[21rem] right-4 bottom-4 z-30 h-[33vh] min-h-[15rem] rounded-2xl border border-slate-700 bg-slate-900/85 backdrop-blur shadow-2xl p-4 flex flex-col gap-3 overflow-hidden">
