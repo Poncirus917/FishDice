@@ -62,7 +62,9 @@ export default function ImportView({ onConfirm, characters, setCharacters, userD
       html: `
         <div class="text-left text-sm text-slate-600 mb-3">
           粘贴好友分享的角色码，导入后：<br/>
-          <span class="font-bold text-cyan-600">•</span> PC/NPC 角色将变为 NPC<br/>
+          <span class="font-bold text-cyan-600">•</span> PC 可选择以 PC 或 NPC 身份导入<br/>
+          <span class="font-bold text-cyan-600">•</span> 以 PC 身份导入保留人物设定；以 NPC 身份导入则不带人物设定<br/>
+          <span class="font-bold text-emerald-600">•</span> NPC 保持为 NPC<br/>
           <span class="font-bold text-red-600">•</span> 怪物角色保持为怪物
         </div>
         <textarea id="import-code" class="w-full p-3 border-2 border-slate-300 rounded-xl text-xs font-mono bg-slate-50 text-slate-800" rows="4" placeholder="粘贴 FD- 开头的分享码..."></textarea>
@@ -76,57 +78,88 @@ export default function ImportView({ onConfirm, characters, setCharacters, userD
         const textarea = document.getElementById('import-code') as HTMLTextAreaElement;
         return textarea?.value || '';
       }
-    }).then((result) => {
+    }).then(async (result) => {
       if (!result.isConfirmed || !result.value) return;
-      
+
       try {
-        const data = decodeShareCode(result.value);
+        const data = await decodeShareCode(result.value);
         const originalType = data.type as 'pc' | 'npc' | 'mob';
-        const importAs = originalType === 'mob' ? 'mob' : 'npc';
-        
-        Swal.fire({
-          title: "选择导入类型",
-          html: `
-            <p class="text-sm text-slate-600 mb-4">
-              分享的角色 "<span class="font-bold">${data.name}</span>" 原本是 <b>${originalType === 'pc' ? 'PC' : originalType === 'npc' ? 'NPC' : '怪物'}</b>。<br/>
-              导入类型必须为：<b class="${originalType === 'mob' ? 'text-red-600' : 'text-emerald-600'}">${importAs === 'mob' ? '怪物' : 'NPC'}</b>
-            </p>
-          `,
-          icon: 'info',
-          confirmButtonText: `以 ${importAs === 'mob' ? '怪物' : 'NPC'} 身份导入`,
-          confirmButtonColor: '#0891b2'
-        }).then((importResult) => {
-          if (!importResult.isConfirmed) return;
-          
-          if (!validateImportType(originalType, importAs)) {
-            Swal.fire({ icon: 'error', title: '导入失败', text: '无效的类型组合' });
-            return;
-          }
-          
-          const newChar: CharacterState = {
-            id: Date.now().toString(),
-            name: data.name,
-            type: importAs,
-            plName: importAs === 'npc' ? 'GM操作' : '未知PL',
-            avatar: data.avatar,
-            story: data.story,
-            hp: data.hp,
-            mp: data.mp,
-            san: data.san,
-            luck: data.luck,
-            skills: data.skills,
-            attributes: data.attributes,
-            status: [],
-          };
-          
-          onConfirm(newChar);
-          Swal.fire({
-            icon: 'success',
-            title: '导入成功',
-            text: `"${data.name}" 已成功导入为 ${importAs === 'mob' ? '怪物' : 'NPC'}`,
-            timer: 2000,
-            showConfirmButton: false,
+
+        // 选择导入身份：PC 可选 PC/NPC；NPC / 怪物固定原身份
+        let importAs: 'pc' | 'npc' | 'mob';
+        if (originalType === 'pc') {
+          const choice = await Swal.fire({
+            title: "选择导入类型",
+            html: `
+              <p class="text-sm text-slate-600 mb-4">
+                分享的角色 "<span class="font-bold">${data.name}</span>" 原本是 <b class="text-cyan-600">PC（调查员）</b>。<br/>
+                请选择导入身份：
+              </p>
+            `,
+            icon: 'info',
+            showDenyButton: true,
+            confirmButtonText: '以 PC 身份导入',
+            confirmButtonColor: '#0891b2',
+            denyButtonText: '以 NPC 身份导入',
+            denyButtonColor: '#059669',
+            showCancelButton: true,
+            cancelButtonText: '取消',
+            reverseButtons: true
           });
+          if (choice.isConfirmed) importAs = 'pc';
+          else if (choice.isDenied) importAs = 'npc';
+          else return;
+        } else {
+          importAs = originalType === 'mob' ? 'mob' : 'npc';
+          const info = await Swal.fire({
+            title: "选择导入类型",
+            html: `
+              <p class="text-sm text-slate-600 mb-4">
+                分享的角色 "<span class="font-bold">${data.name}</span>" 原本是 <b>${originalType === 'mob' ? '怪物' : 'NPC'}</b>。<br/>
+                导入身份为：<b class="${originalType === 'mob' ? 'text-red-600' : 'text-emerald-600'}">${importAs === 'mob' ? '怪物' : 'NPC'}</b>
+              </p>
+            `,
+            icon: 'info',
+            confirmButtonText: `以 ${importAs === 'mob' ? '怪物' : 'NPC'} 身份导入`,
+            confirmButtonColor: '#0891b2'
+          });
+          if (!info.isConfirmed) return;
+        }
+
+        if (!validateImportType(originalType, importAs)) {
+          Swal.fire({ icon: 'error', title: '导入失败', text: '无效的类型组合' });
+          return;
+        }
+
+        // 人物设定（背景 + 随身物品）仅以 PC 身份导入时保留；以 NPC 身份导入不带
+        const isPcImport = importAs === 'pc';
+        const newChar: CharacterState = {
+          id: Date.now().toString(),
+          name: data.name,
+          type: importAs,
+          plName: importAs === 'pc' ? '未知PL' : 'GM操作',
+          avatar: data.avatar,
+          story: data.story,
+          hp: data.hp,
+          mp: data.mp,
+          san: data.san,
+          luck: data.luck,
+          skills: data.skills,
+          attributes: data.attributes,
+          weapons: data.weapons,
+          backgrounds: isPcImport ? data.backgrounds : undefined,
+          possessions: isPcImport ? data.possessions : undefined,
+          spells: data.spells,
+          status: [],
+        };
+
+        onConfirm(newChar);
+        Swal.fire({
+          icon: 'success',
+          title: '导入成功',
+          text: `"${data.name}" 已成功导入为 ${importAs === 'pc' ? 'PC' : importAs === 'npc' ? 'NPC' : '怪物'}`,
+          timer: 2000,
+          showConfirmButton: false,
         });
       } catch (e) {
         Swal.fire({

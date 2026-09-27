@@ -4,9 +4,15 @@ import { useState, useEffect, useRef } from 'react';
 import toast from 'react-hot-toast';
 import { useRoom } from './RoomContext';
 import { useConfirmDialog } from './ConfirmDialog';
+import NpcImportModal from './NpcImportModal';
+import CharacterCardModal from './CharacterCardModal';
 import { supabase } from '../../lib/supabase';
 import type { DiceGroup } from '../../utils/dice';
 import type { CharacterState } from '../../(single)/page';
+import type { RoomNpcEntry, DiceLog } from './roomTypes';
+import { getRoomNpcEntries, setRoomNpcVisible, removeRoomNpcEntry, deleteDiceLog, insertDiceLog, revealCardSection } from './roomService';
+import { rulesFromRoom, sectionsForViewer, revealedFromMember, CARD_SECTION_OPTIONS } from './roomRules';
+import type { CardSection } from './roomRules';
 
 interface RoomViewProps {
   userId: string;
@@ -16,27 +22,49 @@ interface RoomViewProps {
 }
 
 export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby }: RoomViewProps) {
-  const { currentRoom, loading, pauseRoom, deleteRoom, leaveRoom, detachFromRoom, loadRoom, renameRoom, broadcastMemberRemoved, diceLogs, performCheck, performCustomRoll } = useRoom();
+  const { currentRoom, loading, pauseRoom, deleteRoom, leaveRoom, detachFromRoom, loadRoom, renameRoom, broadcastMemberRemoved, diceLogs, performCheck, performCustomRoll, broadcastToRoom } = useRoom();
   const { showConfirm, Dialog } = useConfirmDialog();
   const [allCharacters, setAllCharacters] = useState<Record<string, CharacterState>>({});
+  const [roomNpcEntries, setRoomNpcEntries] = useState<RoomNpcEntry[]>([]);
+  // 侧栏虚线加号框打开的添加弹窗类型（null = 关闭）
+  const [npcImportType, setNpcImportType] = useState<'npc' | 'mob' | null>(null);
+  const [npcOpBusy, setNpcOpBusy] = useState(false);
+  const [npcRefreshKey, setNpcRefreshKey] = useState(0);
   const [myCharacterId, setMyCharacterId] = useState<string | null>(null);
   const [manageMembersModal, setManageMembersModal] = useState(false);
+  // KP “设置”弹窗（暂停 / 删除 / 成员管理）
+  const [roomSettingsOpen, setRoomSettingsOpen] = useState(false);
+  // 房间信息弹窗（点击头部房间号方框打开；KP/PL 均可查看房规）
+  const [rulesInfoOpen, setRulesInfoOpen] = useState(false);
+  // KP 揭示角色卡分区的请求锁
+  const [revealBusy, setRevealBusy] = useState(false);
   const [selectedMembers, setSelectedMembers] = useState<string[]>([]);
   // KP 修改房间名
   const [renameModalOpen, setRenameModalOpen] = useState(false);
   const [renameValue, setRenameValue] = useState('');
   const [renameSubmitting, setRenameSubmitting] = useState(false);
+  // 角色卡查看浮窗（点击左侧角色栏的 PC/NPC/怪物打开；NPC/怪物仅 KP 可打开；null = 关闭）
+  const [viewCard, setViewCard] = useState<CharacterState | null>(null);
 
   // 掷骰面板
   const [rollTab, setRollTab] = useState<'check' | 'custom'>('check');
   const [checkLabel, setCheckLabel] = useState('');
   const [checkTarget, setCheckTarget] = useState<number | ''>('');
-  const [selectedNpcId, setSelectedNpcId] = useState<string>('');
+  const [selectedEntryId, setSelectedEntryId] = useState<string>('');
   // 自由掷骰
   const [freeLabel, setFreeLabel] = useState('');
   const [freeDiceGroups, setFreeDiceGroups] = useState<DiceGroup[]>([{ count: 1, sides: 6 }]);
   const [freeBonus, setFreeBonus] = useState<number>(0);
   const logListRef = useRef<HTMLDivElement>(null);
+
+  // 掷骰记录悬浮侧栏（常态隐藏，右缘 LOGS 按钮展开）
+  const [logsOpen, setLogsOpen] = useState(false);
+  // 面板默认半透明（可透视页面），点击面板内部后转为不透明
+  const [logsTouched, setLogsTouched] = useState(false);
+  // 私有笔记弹窗（笔记仅自己可见）
+  const [noteModalOpen, setNoteModalOpen] = useState(false);
+  const [noteText, setNoteText] = useState('');
+  const [noteBusy, setNoteBusy] = useState(false);
 
   // 调试日志
   useEffect(() => {
@@ -62,66 +90,61 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
   const myMembership = currentRoom?.members.find(m => m.user_id === userId);
   const myRole = isCreator ? 'kp' : (myMembership?.role || 'pl');
 
-  // 加载所有成员的角色数据
+  // 加载房间所有角色：成员（PL）角色 + KP 通过 room_npcs 导入的 NPC/怪物
   useEffect(() => {
     if (!currentRoom) return;
 
     // 先清空旧的角色数据，避免显示过时的信息
     setAllCharacters({});
 
-    const memberCharacterIds = currentRoom.members
-      .filter(m => m.character_id && m.character_id !== '')
-      .map(m => m.character_id);
+    (async () => {
+      const memberCharacterIds = currentRoom.members
+        .filter(m => m.character_id && m.character_id !== '')
+        .map(m => m.character_id as string);
 
-    console.log('RoomView - loading characters:', memberCharacterIds);
-    console.log('RoomView - currentRoom members:', currentRoom.members.map(m => ({
-      id: m.id,
-      user_id: m.user_id,
-      role: m.role,
-      character_id: m.character_id,
-      character_id_type: typeof m.character_id,
-      character_id_length: m.character_id?.length
-    })));
+      // 房间角色实例（KP 看到全部；PL 受 RLS 限制只返回 visible 实例）
+      const entryList = await getRoomNpcEntries(currentRoom.id)
+        .catch(err => { console.error('RoomView - room_npcs error:', err); return [] as RoomNpcEntry[]; });
+      setRoomNpcEntries(entryList);
 
-    if (memberCharacterIds.length === 0) {
-      setAllCharacters({});
-      return;
-    }
+      const npcCharIds = [...new Set(entryList.map(e => e.character_id))];
+      const allIds = [...new Set([...memberCharacterIds, ...npcCharIds])];
+      console.log('RoomView - loading characters:', { memberCharacterIds, npcCharIds, entryCount: entryList.length });
 
-    // 尝试两种查询方式
-    supabase
-      .from('characters')
-      .select('id, data')
-      .in('data->>id', memberCharacterIds)  // 直接用 data->>id 查询，因为 character_id 就是 data.id
-      .then(({ data, error }) => {
-        console.log('RoomView - characters result:', { data, error, count: data?.length });
-        if (error) {
-          console.error('RoomView - characters error:', error);
-          setAllCharacters({});
-          return;
-        }
-        if (data && data.length > 0) {
-          const charMap: Record<string, CharacterState> = {};
-          data.forEach(row => {
-            console.log('RoomView - row:', { rowId: row.id, dataId: row.data?.id });
-            if (row.data) {
-              const charData = row.data as CharacterState;
-              // 用 data.id（角色自定义 ID）作为 key
-              if (charData.id) {
-                charMap[charData.id] = charData;
-              }
-              // 也用数据库 id 作为 key
-              charMap[String(row.id)] = charData;
-            }
-          });
-          console.log('RoomView - charMap:', charMap);
-          setAllCharacters(charMap);
-        } else {
-          console.warn('RoomView - no characters found for memberCharacterIds:', memberCharacterIds);
-          setAllCharacters({});
-        }
+      if (allIds.length === 0) {
+        setAllCharacters({});
+        return;
+      }
+
+      const { data, error } = await supabase
+        .from('characters')
+        .select('id, data')
+        .in('data->>id', allIds);  // character_id 存的是 data.id 业务 ID
+
+      console.log('RoomView - characters result:', { data, error, count: data?.length });
+      if (error) {
+        console.error('RoomView - characters error:', error);
+        setAllCharacters({});
+        return;
+      }
+      const charMap: Record<string, CharacterState> = {};
+      (data || []).forEach(row => {
+        if (!row.data) return;
+        const charData = row.data as CharacterState;
+        // 用 data.id（角色自定义 ID）作为 key，同时保留数据库 id key
+        if (charData.id) charMap[charData.id] = charData;
+        charMap[String(row.id)] = charData;
       });
-  }, [currentRoom]);
+      setAllCharacters(charMap);
+    })();
+  }, [currentRoom, npcRefreshKey]);
+
+  // room_npcs 实时变更（KP 导入/移除）：递增 key 触发上面的 effect 重新加载
+  useEffect(() => {
+    const handler = () => setNpcRefreshKey(k => k + 1);
+    window.addEventListener('room-npcs-changed', handler);
+    return () => window.removeEventListener('room-npcs-changed', handler);
+  }, []);
 
   useEffect(() => {
     if (myMembership?.character_id && myMembership.character_id !== '') {
@@ -129,17 +152,85 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
     }
   }, [myMembership]);
 
-  // 新日志到达时自动滚动到底部（像聊天软件一样跟随最新消息）
+  // 新日志到达时自动滚动到底部（像聊天软件一样跟随最新消息）；打开侧栏时也滚到底
   useEffect(() => {
     const el = logListRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [diceLogs]);
+  }, [diceLogs, logsOpen]);
 
-  // KP 可代掷的角色：房间内已加载的 NPC / 怪物（allCharacters 按 data.id 与 db id 双 key 存储，需按 c.id 去重）
-  const npcOptions = Object.values(allCharacters).reduce<CharacterState[]>((acc, c) => {
-    if ((c.type === 'npc' || c.type === 'mob') && !acc.some(x => x.id === c.id)) acc.push(c);
-    return acc;
-  }, []);
+  // KP：切换剧本角色在场/不在场（行离开 PL 的 RLS 可见集合时 postgres_changes 可能丢事件，用广播兜底）
+  const handleToggleNpcVisible = async (entry: RoomNpcEntry) => {
+    const next = !entry.visible;
+    setNpcOpBusy(true);
+    try {
+      await setRoomNpcVisible(entry.id, next);
+      setRoomNpcEntries(prev => prev.map(e => (e.id === entry.id ? { ...e, visible: next } : e)));
+      await broadcastToRoom('room_npcs_changed').catch(err => {
+        console.error('广播 room_npcs_changed 失败:', err);
+        toast.error('同步通知发送失败，请让其他 PL 手动刷新');
+      });
+    } catch (err: any) {
+      toast.error(err.message || '切换失败');
+    } finally {
+      setNpcOpBusy(false);
+    }
+  };
+
+  // KP：从房间移除剧本角色（在场角色由 RLS 拦截，提示先设为不在场）
+  const handleRemoveNpcEntry = async (entry: RoomNpcEntry) => {
+    setNpcOpBusy(true);
+    try {
+      await removeRoomNpcEntry(entry.id);
+      setRoomNpcEntries(prev => prev.filter(e => e.id !== entry.id));
+      toast.success('已从房间移除');
+    } catch (err: any) {
+      toast.error(err.message || '移除失败');
+    } finally {
+      setNpcOpBusy(false);
+    }
+  };
+
+  // KP：揭示某 PL 角色卡的一个分区（不可逆）；room_members UPDATE 自动刷新房间，
+  // 再以 room_update 广播兜底。同时写入一条 status 日志：进入 LOGS 记录，
+  // 并通过现有的掷骰结果悬浮通道在右侧对所有人弹出提示
+  const handleRevealSection = (memberId: string, charName: string) => async (section: CardSection) => {
+    if (revealBusy) return;
+    setRevealBusy(true);
+    try {
+      await revealCardSection(memberId, section);
+      await broadcastToRoom('room_update').catch(() => {});
+
+      const sectionLabel = CARD_SECTION_OPTIONS.find(o => o.key === section)?.label || section;
+      await insertDiceLog({
+        room_id: currentRoom!.id,
+        user_id: userId,
+        msg_type: 'status',
+        label: `🔓 揭示了「${charName}」的${sectionLabel}`,
+      }).catch(err => {
+        console.error('写入揭示日志失败:', err);
+      });
+
+      toast.success('已揭示给所有玩家');
+    } catch (err: any) {
+      toast.error(err.message || '揭示失败');
+    } finally {
+      setRevealBusy(false);
+    }
+  };
+
+  // KP 可代掷的角色实例：每个 room_npcs 实例一项，同一怪物的多个实例分别列出并编号
+  const npcOptions = roomNpcEntries
+    .map(entry => {
+      const character = allCharacters[entry.character_id];
+      if (!character) return null;
+      const sameCharEntries = roomNpcEntries.filter(e => e.character_id === entry.character_id);
+      const no = sameCharEntries.indexOf(entry) + 1;
+      const display = character.type === 'mob' && sameCharEntries.length > 1
+        ? `${character.name} #${no}`
+        : character.name;
+      return { entryId: entry.id, character, display };
+    })
+    .filter((x): x is { entryId: string; character: CharacterState; display: string } => x !== null);
   const kpCanCheck = npcOptions.length > 0;
 
   // KP 没有可代掷角色时自动切到自由掷骰页签（检定行为必须绑定角色）
@@ -163,12 +254,17 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
 
     try {
       if (isCreator) {
-        const npc = npcOptions.find(c => c.id === selectedNpcId) || npcOptions[0];
-        if (!npc) {
+        const opt = npcOptions.find(o => o.entryId === selectedEntryId) || npcOptions[0];
+        if (!opt) {
           toast('没有可代掷的 NPC/怪物，请使用自由掷骰');
           return;
         }
-        await performCheck({ label, target, characterId: npc.id, charName: npc.name });
+        await performCheck({
+          label,
+          target,
+          characterId: opt.character.id,
+          charName: opt.display,
+        });
       } else {
         const myChar = myCharacterId ? allCharacters[myCharacterId] : null;
         await performCheck({
@@ -241,6 +337,211 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
   // 格式化日志时间
   const formatLogTime = (iso: string) =>
     new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+
+  // 掷骰结果悬浮提示队列：新骰子从底部入队、先出现的被顶上去，6 秒后自动消失
+  const [rollToasts, setRollToasts] = useState<DiceLog[]>([]);
+  // 已弹过提示的日志 id（防止重复弹出）
+  const seenToastIdsRef = useRef<Set<string>>(new Set());
+
+  // diceLogs 新增且为近期掷出（30 秒时间窗口，避免重进房间时历史日志误弹）→ 入队弹出；
+  // 笔记（note）为私有内容不弹提示
+  useEffect(() => {
+    const now = Date.now();
+    const fresh = diceLogs.filter(l =>
+      l.msg_type !== 'note' &&
+      !seenToastIdsRef.current.has(l.id) &&
+      now - new Date(l.created_at).getTime() < 30000
+    );
+    if (fresh.length === 0) return;
+    fresh.forEach(l => seenToastIdsRef.current.add(l.id));
+    setRollToasts(prev => {
+      const merged = [...prev, ...fresh];
+      return merged.length > 5 ? merged.slice(merged.length - 5) : merged;
+    });
+    fresh.forEach(l => {
+      setTimeout(() => {
+        setRollToasts(prev => prev.filter(t => t.id !== l.id));
+      }, 6000);
+    });
+  }, [diceLogs]);
+
+  // 删除单条记录：KP 可删任何掷骰记录，PL 只能删自己的笔记（RLS：作者或 KP 可删）。
+  // 删除后通过 postgres_changes DELETE 事件 + dice_log_deleted 广播双通道同步到所有客户端
+  const handleDeleteLog = (log: DiceLog) => {
+    const isMyNote = log.msg_type === 'note' && log.user_id === userId;
+    showConfirm({
+      title: isMyNote ? '删除笔记' : '删除掷骰记录',
+      message: isMyNote
+        ? '确定要删除这条笔记吗？笔记仅自己可见，删除后只影响你自己。'
+        : '确定要删除这条记录吗？删除后所有成员均不再可见。',
+      confirmText: '删除',
+      confirmColor: '#dc2626',
+      onConfirm: async () => {
+        try {
+          await deleteDiceLog(log.id);
+          // postgres_changes DELETE 之外再加广播兜底，确保其它端实时移除
+          await broadcastToRoom('dice_log_deleted', { id: log.id }).catch(() => {});
+          toast.success('已删除');
+        } catch (err: any) {
+          toast.error(err.message || '删除失败');
+        }
+      },
+    });
+  };
+
+  // 保存私有笔记（msg_type='note'，RLS 保证仅作者本人可读，其他人不可见）
+  const handleSaveNote = async () => {
+    if (!currentRoom) return;
+    const text = noteText.trim();
+    if (!text) {
+      toast('请输入笔记内容');
+      return;
+    }
+    setNoteBusy(true);
+    try {
+      const myChar = myCharacterId ? allCharacters[myCharacterId] : null;
+      await insertDiceLog({
+        room_id: currentRoom.id,
+        user_id: userId,
+        character_id: myCharacterId ?? null,
+        char_name: isCreator ? '守秘人' : (myChar?.name || displayName),
+        msg_type: 'note',
+        label: '记录',
+        level: text,
+      });
+      toast.success('笔记已保存（仅自己可见）');
+      setNoteModalOpen(false);
+      setNoteText('');
+    } catch (err: any) {
+      toast.error(err.message || '保存失败');
+    } finally {
+      setNoteBusy(false);
+    }
+  };
+
+  // 导出掷骰记录为 TXT（含自己的私有笔记；格式参考单机版）
+  const exportLogs = () => {
+    if (!currentRoom || diceLogs.length === 0) return;
+
+    const now = new Date();
+    const dateStr = now.toISOString().split('T')[0];
+    const fileName = `log_${dateStr}_${now.getHours()}${now.getMinutes()}.txt`;
+    const header = `--- COC Dice Log Export (${now.toLocaleString()}) ---\n\n`;
+
+    const content = diceLogs.map(log => {
+      const sender = currentRoom.members.find(m => m.user_id === log.user_id);
+      const name = (isCreator && log.user_id === currentRoom.creator_id)
+        ? '守秘人'
+        : (log.char_name || sender?.profile?.display_name || '未知');
+      const time = formatLogTime(log.created_at);
+
+      if (log.msg_type === 'note') {
+        return `[${time}] ${name} - 记录: ${log.level || ''}`;
+      }
+      if (log.msg_type === 'check' || log.msg_type === 'hidden') {
+        return `[${time}] ${name} - ${log.label}: ${log.level || ''} (Roll:${log.roll ?? '-'}/${log.target ?? '-'})`;
+      }
+      if (log.msg_type === 'custom') {
+        return `[${time}] ${name} - ${log.label}: ${log.level || ''} (总计:${log.roll ?? '-'})`;
+      }
+      // damage / status / request 等文字类日志
+      return `[${time}] ${name} - ${log.label || log.level || ''}`;
+    }).join('\n');
+
+    const blob = new Blob([header + content], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = fileName;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  // 单条日志卡片渲染（LOGS 面板与掷骰结果悬浮提示共用）
+  // showDelete：是否显示悬停删除按钮（KP 对所有记录显示；PL 仅对自己的笔记显示）
+  const renderLogCard = (log: DiceLog, showDelete: boolean) => {
+    if (!currentRoom) return null;
+    const sender = currentRoom.members.find(m => m.user_id === log.user_id);
+    const senderName = isCreator && log.user_id === currentRoom.creator_id
+      ? '守秘人'
+      : (log.char_name || sender?.profile?.display_name || '未知');
+    const isCheckType = log.msg_type === 'check' || log.msg_type === 'hidden';
+    const isNote = log.msg_type === 'note';
+
+    return (
+      <div
+        key={log.id}
+        className={`group relative p-2.5 rounded-lg border transition-all ${
+          isNote
+            ? 'bg-cyan-950/30 border-cyan-900/50'
+            : 'bg-slate-800/70 border-slate-700/60'
+        }`}
+      >
+        {showDelete && (
+          <button
+            onClick={() => handleDeleteLog(log)}
+            title="删除这条记录"
+            className="absolute -top-2 -right-2 w-4 h-5 bg-slate-900 border border-slate-600 rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity shadow-sm hover:text-red-500"
+          >
+            <span className="text-[10px] font-bold">✕</span>
+          </button>
+        )}
+
+        <div className="flex justify-between items-start mb-1 gap-2">
+          <div className="text-slate-500 text-[9px] font-mono flex items-center gap-1.5 pt-0.5">
+            {formatLogTime(log.created_at)}
+            {isNote && <span className="text-cyan-600">📝 仅自己可见</span>}
+          </div>
+          <div className="text-[11px] font-black px-1.5 py-0.5 bg-slate-700/80 text-slate-300 rounded tracking-tight flex-shrink-0">
+            {senderName}
+          </div>
+        </div>
+
+        {log.msg_type === 'hidden' ? (
+          /* KP 视角的暗骰行（PL 端 RLS 收不到 hidden 行） */
+          <>
+            <div className="font-bold text-[14px] mb-1 text-purple-300">{log.label}</div>
+            <div className="flex items-baseline justify-between">
+              <div className="font-mono text-[11px] text-slate-500">
+                Roll: <b className="text-white">{log.roll}</b>/{log.target}
+              </div>
+              <div className={`font-black text-[14px] italic ${getLevelClass(log.level)}`}>
+                {log.level}
+              </div>
+            </div>
+          </>
+        ) : isCheckType && log.roll !== null ? (
+          <>
+            <div className="font-bold text-[15px] mb-1 text-slate-200">{log.label}</div>
+            <div className="flex items-baseline justify-between">
+              <div className="font-mono text-[11px] text-slate-500">
+                Roll: <b className="text-white">{log.roll}</b>/{log.target}
+              </div>
+              <div className={`font-black text-[15px] italic ${getLevelClass(log.level)}`}>
+                {log.level}
+              </div>
+            </div>
+          </>
+        ) : log.msg_type === 'custom' ? (
+          <>
+            <div className="font-bold text-[15px] mb-1 text-slate-200">{log.label}</div>
+            <div className="flex items-baseline justify-between gap-2">
+              <div className="font-mono text-[11px] text-slate-500 break-all min-w-0">{log.level}</div>
+              <div className="font-black text-[15px] text-cyan-300 flex-shrink-0">{log.roll}</div>
+            </div>
+          </>
+        ) : isNote ? (
+          <div className="text-[13px] text-cyan-100/90 whitespace-pre-wrap break-words leading-relaxed">
+            {log.level}
+          </div>
+        ) : (
+          <div className="text-sm text-slate-300">{log.label || log.level}</div>
+        )}
+      </div>
+    );
+  };
 
   // 监听被踢出房间的事件
   useEffect(() => {
@@ -396,6 +697,7 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
       title: '删除房间',
       message: '⚠️ 警告：此操作不可恢复！\n\n删除后：\n• 所有成员将被移出\n• 房间内所有信息将被清空\n• 无法再次加入\n\n你确定要删除此房间吗？',
       confirmText: '永久删除',
+      confirmColor: '#dc2626',
       onConfirm: async () => {
         try {
           await deleteRoom();
@@ -624,10 +926,14 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
                   </div>
                 </div>
 
-                {/* 下方角色卡片 */}
+                {/* 下方角色卡片（点击查看角色卡浮窗） */}
                 {!isKP && character && (
                   <div className="px-4 pb-3 pl-16">
-                    <div className="flex items-center gap-2 mt-2">
+                    <div
+                      className="flex items-center gap-2 mt-2 cursor-pointer hover:bg-slate-700/60 rounded-lg px-2 py-1.5 -mx-2 transition"
+                      title="查看角色卡"
+                      onClick={() => { if (character) setViewCard(character); }}
+                    >
                       <div className="w-8 h-8 rounded-lg bg-cyan-600 flex items-center justify-center text-sm font-bold overflow-hidden">
                         {character.avatar ? (
                           <img src={character.avatar} alt="" className="w-full h-full object-cover" />
@@ -674,13 +980,17 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
                 </div>
                 <div className="flex items-center gap-2">
                   {character && (
-                    <div className="w-8 h-8 rounded-lg bg-slate-700 flex items-center justify-center text-sm overflow-hidden">
+                    <button
+                      className="w-8 h-8 rounded-lg bg-slate-700 flex items-center justify-center text-sm overflow-hidden cursor-pointer hover:ring-1 hover:ring-cyan-500 transition"
+                      title="查看角色卡"
+                      onClick={() => { if (character) setViewCard(character); }}
+                    >
                       {character.avatar ? (
                         <img src={character.avatar} alt="" className="w-full h-full object-cover" />
                       ) : (
                         <span className="text-slate-400">{character.name[0]}</span>
                       )}
-                    </div>
+                    </button>
                   )}
                 </div>
               </div>
@@ -692,6 +1002,110 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
               暂无成员加入
             </p>
           )}
+
+          {/* 剧本角色：NPC 与怪物分别列出。
+              PL：只看到在场（visible）实例，无任何操作；KP：看到全部实例，
+              行内有在场/不在场切换，悬停出现 × 删除（仅不在场可删）；
+              KP 每个分区底部有虚线加号框用于添加 */}
+          {(() => {
+            const sectionEntries = roomNpcEntries.filter(e => isCreator || e.visible);
+            const npcList = sectionEntries.filter(e => allCharacters[e.character_id]?.type === 'npc');
+            const mobList = sectionEntries.filter(e => allCharacters[e.character_id]?.type === 'mob');
+            // PL 两个分区都为空时整块不显示；KP 始终显示（含添加入口）
+            if (!isCreator && npcList.length === 0 && mobList.length === 0) return null;
+
+            // 同一怪物多实例编号（按全部实例的加入顺序）
+            const instanceLabel = (entry: RoomNpcEntry): string => {
+              const c = allCharacters[entry.character_id];
+              if (!c) return '';
+              const sameList = roomNpcEntries.filter(e => e.character_id === entry.character_id);
+              if (c.type === 'mob' && sameList.length > 1) {
+                return `${c.name} #${sameList.indexOf(entry) + 1}`;
+              }
+              return c.name;
+            };
+
+            const renderSection = (title: string, icon: string, list: RoomNpcEntry[], isMobSection: boolean) => {
+              if (!isCreator && list.length === 0) return null;
+              const addType = isMobSection ? 'mob' as const : 'npc' as const;
+              return (
+                <div className="space-y-1.5">
+                  <p className="text-[10px] font-black text-slate-500 uppercase tracking-widest px-1">
+                    {icon} {title}{list.length > 0 ? ` (${list.length})` : ''}
+                  </p>
+                  {list.map(entry => {
+                    const c = allCharacters[entry.character_id];
+                    if (!c) return null;
+                    return (
+                      <div
+                        key={entry.id}
+                        onClick={() => { if (isCreator && c) setViewCard(c); }}
+                        title={isCreator ? '查看角色卡' : undefined}
+                        className={`group flex items-center gap-2.5 px-2 py-1.5 rounded-lg hover:bg-slate-800/60 transition ${
+                          isCreator ? 'cursor-pointer' : ''
+                        } ${isCreator && !entry.visible ? 'opacity-55' : ''}`}
+                      >
+                        <div className={`w-8 h-8 rounded-lg flex items-center justify-center text-xs font-bold overflow-hidden flex-shrink-0 ${
+                          isMobSection ? 'bg-red-700' : 'bg-emerald-700'
+                        }`}>
+                          {c.avatar ? (
+                            <img src={c.avatar} alt="" className="w-full h-full object-cover" />
+                          ) : (
+                            c.name[0]
+                          )}
+                        </div>
+                        <span className="text-xs font-medium text-slate-300 truncate flex-1">
+                          {instanceLabel(entry)}
+                        </span>
+                        {isCreator ? (
+                          <>
+                            {/* 在场/不在场切换标识 */}
+                            <button
+                              onClick={e => { e.stopPropagation(); handleToggleNpcVisible(entry); }}
+                              disabled={npcOpBusy}
+                              title={entry.visible ? '点击设为不在场' : '点击设为在场'}
+                              className={`px-1.5 py-0.5 rounded text-[9px] font-bold flex-shrink-0 transition disabled:opacity-50 ${
+                                entry.visible
+                                  ? 'bg-cyan-600/80 hover:bg-cyan-500 text-white'
+                                  : 'bg-slate-700 hover:bg-slate-600 text-slate-300'
+                              }`}
+                            >
+                              {entry.visible ? '在场' : '不在场'}
+                            </button>
+                            {/* 悬停显示的删除 ×：在场角色点删除会被拦截提示 */}
+                            <button
+                              onClick={e => { e.stopPropagation(); handleRemoveNpcEntry(entry); }}
+                              disabled={npcOpBusy}
+                              title={entry.visible ? '在场角色不可移除，请先设为不在场' : '从房间移除'}
+                              className="w-4 h-4 flex items-center justify-center rounded-full text-[11px] leading-none text-slate-500 hover:text-red-400 hover:bg-slate-700 opacity-0 group-hover:opacity-100 transition flex-shrink-0 disabled:opacity-50"
+                            >
+                              ×
+                            </button>
+                          </>
+                        ) : null}
+                      </div>
+                    );
+                  })}
+                  {/* KP 添加入口：虚线加号框 */}
+                  {isCreator && (
+                    <button
+                      onClick={() => setNpcImportType(addType)}
+                      className="w-full border border-dashed border-slate-700 hover:border-cyan-500 text-slate-500 hover:text-cyan-400 rounded-lg py-2 text-[11px] flex items-center justify-center gap-1.5 transition"
+                    >
+                      <span className="text-sm leading-none font-bold">+</span> 添加{title}
+                    </button>
+                  )}
+                </div>
+              );
+            };
+
+            return (
+              <div className="pt-3 mt-3 border-t border-slate-700/60 space-y-3">
+                {renderSection('NPC', '👤', npcList, false)}
+                {renderSection('怪物', '👹', mobList, true)}
+              </div>
+            );
+          })()}
         </div>
       </aside>
 
@@ -717,11 +1131,16 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
             )}
           </div>
           <div className="flex items-center gap-3">
-            <div className="px-3 py-1 bg-slate-800 rounded-lg border border-slate-700">
+            {/* 点击房间号方框查看房间信息（房规），KP/PL 均可 */}
+            <button
+              onClick={() => setRulesInfoOpen(true)}
+              title="查看房间信息"
+              className="px-3 py-1 bg-slate-800 rounded-lg border border-slate-700 hover:border-cyan-600 hover:bg-slate-700/60 transition cursor-pointer"
+            >
               <span className="text-xs text-slate-500 mr-2">房间号</span>
               <span className="text-sm font-bold text-cyan-400">{currentRoom.room_code}</span>
-            </div>
-            {/* KP 进入暂停房间时会自动恢复，因此正常渲染操作按钮 */}
+            </button>
+            {/* KP：暂停/删除/成员管理合并为“设置”；PL：暂离 */}
             <div className="flex items-center gap-2">
               {myRole === 'pl' && (
                 <button
@@ -733,300 +1152,393 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
               )}
               {isCreator && (
                 <button
-                  onClick={handlePauseRoom}
-                  className="px-3 py-1.5 bg-amber-600 hover:bg-amber-500 rounded-lg text-sm font-bold transition"
+                  onClick={() => setRoomSettingsOpen(true)}
+                  className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded-lg text-sm font-bold transition flex items-center gap-1.5"
                 >
-                  暂停房间
-                </button>
-              )}
-              {isCreator && (
-                <button
-                  onClick={handleDeleteRoom}
-                  className="px-3 py-1.5 bg-red-600 hover:bg-red-500 rounded-lg text-sm font-bold transition"
-                >
-                  删除房间
+                  <span>⚙️</span> 设置
                 </button>
               )}
               <button
                 onClick={handleLeaveRoom}
                 className={`px-3 py-1.5 rounded-lg text-sm font-bold transition ${
                   isCreator
-                    ? 'bg-slate-700 hover:bg-slate-600'
+                    ? 'hidden'
                     : 'bg-red-600/50 hover:bg-red-600 text-red-300'
                 }`}
               >
-                {isCreator ? '管理成员' : '退出房间'}
+                退出房间
               </button>
             </div>
           </div>
         </header>
 
-        {/* 主内容：掷骰面板 + 共享日志流 */}
-        <div className="flex-1 flex min-h-0">
-          <main className="flex-1 overflow-y-auto p-8">
-            <div className="max-w-xl mx-auto">
-              <div className="rounded-2xl bg-slate-800/60 border border-slate-700 p-6 space-y-5">
-                {/* 页签切换 */}
-                <div className="flex gap-1 p-1 bg-slate-900/60 rounded-xl">
-                  <button
-                    onClick={() => setRollTab('check')}
-                    disabled={isCreator && !kpCanCheck}
-                    className={`flex-1 py-2 rounded-lg text-xs font-bold transition ${
-                      rollTab === 'check'
-                        ? 'bg-cyan-600 text-white'
-                        : 'text-slate-400 hover:text-slate-200'
-                    } ${isCreator && !kpCanCheck ? 'opacity-40 cursor-not-allowed' : ''}`}
+        {/* 主内容区：上部空间暂留作他用 */}
+        <div className="flex-1 min-h-0" />
+
+        {/* 底部掷骰面板（悬浮窗）：贴页面下方、避开左侧角色栏（w-80）、高约 1/3；内容单行排布，不做内部滚动 */}
+        <div className="fixed left-[21rem] right-4 bottom-4 z-30 h-[33vh] min-h-[15rem] rounded-2xl border border-slate-700 bg-slate-900/85 backdrop-blur shadow-2xl p-4 flex flex-col gap-3 overflow-hidden">
+          {/* 页签行 */}
+          <div className="flex items-center gap-3 flex-shrink-0">
+            <div className="flex gap-1 p-1 bg-slate-800/80 rounded-xl">
+              <button
+                onClick={() => setRollTab('check')}
+                disabled={isCreator && !kpCanCheck}
+                className={`px-4 py-1.5 rounded-lg text-xs font-bold transition ${
+                  rollTab === 'check'
+                    ? 'bg-cyan-600 text-white'
+                    : 'text-slate-400 hover:text-slate-200'
+                } ${isCreator && !kpCanCheck ? 'opacity-40 cursor-not-allowed' : ''}`}
+              >
+                🎯 技能检定
+              </button>
+              <button
+                onClick={() => setRollTab('custom')}
+                className={`px-4 py-1.5 rounded-lg text-xs font-bold transition ${
+                  rollTab === 'custom'
+                    ? 'bg-cyan-600 text-white'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                🎲 自由掷骰
+              </button>
+            </div>
+            {isCreator && !kpCanCheck && (
+              <p className="text-[11px] text-amber-500/80 leading-tight">
+                检定类掷骰必须绑定角色：请先在左侧导入 NPC / 怪物并加入房间
+              </p>
+            )}
+          </div>
+
+          {/* 技能检定：单行布局 */}
+          {rollTab === 'check' && (
+            <div className="flex-1 min-h-0 flex items-center justify-center gap-3">
+              {isCreator ? (
+                <div className="flex items-center gap-2 flex-shrink-0">
+                  <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest">代掷角色</span>
+                  <select
+                    value={selectedEntryId || npcOptions[0]?.entryId || ''}
+                    onChange={e => setSelectedEntryId(e.target.value)}
+                    className="w-44 bg-slate-900/70 border border-slate-700 rounded-xl px-3 py-2.5 text-sm outline-none focus:border-cyan-500"
                   >
-                    🎯 技能检定
-                  </button>
-                  <button
-                    onClick={() => setRollTab('custom')}
-                    className={`flex-1 py-2 rounded-lg text-xs font-bold transition ${
-                      rollTab === 'custom'
-                        ? 'bg-cyan-600 text-white'
-                        : 'text-slate-400 hover:text-slate-200'
-                    }`}
-                  >
-                    🎲 自由掷骰
-                  </button>
+                    {npcOptions.map(o => (
+                      <option key={o.entryId} value={o.entryId}>
+                        {o.character.type === 'mob' ? '怪物·' : 'NPC·'}{o.display}
+                      </option>
+                    ))}
+                  </select>
                 </div>
+              ) : (
+                <p className="text-xs text-slate-500 flex-shrink-0">
+                  掷骰角色：
+                  <span className="text-cyan-400 font-bold">
+                    {(myCharacterId && allCharacters[myCharacterId]?.name) || '未选择角色'}
+                  </span>
+                </p>
+              )}
+              <input
+                type="text"
+                placeholder="检定项目，如：侦查"
+                className="flex-1 bg-slate-900/70 border border-slate-700 rounded-xl px-4 py-2.5 text-sm outline-none focus:border-cyan-500 transition"
+                value={checkLabel}
+                onChange={e => setCheckLabel(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') handlePerformCheck(); }}
+              />
+              <input
+                type="number"
+                min={1}
+                max={100}
+                placeholder="目标值，如：60"
+                className="w-28 bg-slate-900/70 border border-slate-700 rounded-xl px-4 py-2.5 text-sm outline-none focus:border-cyan-500 transition"
+                value={checkTarget}
+                onChange={e => setCheckTarget(e.target.value === '' ? '' : Number(e.target.value))}
+                onKeyDown={e => { if (e.key === 'Enter') handlePerformCheck(); }}
+              />
+              <button
+                onClick={handlePerformCheck}
+                className="px-6 py-2.5 rounded-xl bg-cyan-600 hover:bg-cyan-500 font-bold text-sm transition active:scale-[0.99] flex-shrink-0"
+              >
+                掷 1D100
+              </button>
+            </div>
+          )}
 
-                {rollTab === 'check' && (
-                  <>
-                    <div>
-                      <h3 className="text-base font-bold flex items-center gap-2">
-                        <span>🎯</span> 技能 / 属性检定
-                      </h3>
-                      {isCreator ? (
-                        <div className="mt-2.5 space-y-2">
-                          <p className="text-xs text-slate-500">选择代掷角色：</p>
-                          <select
-                            value={selectedNpcId || npcOptions[0]?.id || ''}
-                            onChange={e => setSelectedNpcId(e.target.value)}
-                            className="w-full bg-slate-900/70 border border-slate-700 rounded-xl px-3 py-2.5 text-sm outline-none focus:border-cyan-500"
-                          >
-                            {npcOptions.map(c => (
-                              <option key={c.id} value={c.id}>
-                                {c.type === 'mob' ? '怪物·' : 'NPC·'}{c.name}
-                              </option>
-                            ))}
-                          </select>
-                        </div>
-                      ) : (
-                        <p className="text-xs text-slate-500 mt-1.5">
-                          掷骰角色：
-                          <span className="text-cyan-400 font-bold">
-                            {(myCharacterId && allCharacters[myCharacterId]?.name) || '未选择角色'}
-                          </span>
-                        </p>
-                      )}
-                    </div>
-
-                    <div className="space-y-3">
-                      <input
-                        type="text"
-                        placeholder="检定项目，如：侦查"
-                        className="w-full bg-slate-900/70 border border-slate-700 rounded-xl px-4 py-3 text-sm outline-none focus:border-cyan-500 transition"
-                        value={checkLabel}
-                        onChange={e => setCheckLabel(e.target.value)}
-                        onKeyDown={e => { if (e.key === 'Enter') handlePerformCheck(); }}
-                      />
-                      <input
-                        type="number"
-                        min={1}
-                        max={100}
-                        placeholder="目标值，如：60"
-                        className="w-full bg-slate-900/70 border border-slate-700 rounded-xl px-4 py-3 text-sm outline-none focus:border-cyan-500 transition"
-                        value={checkTarget}
-                        onChange={e => setCheckTarget(e.target.value === '' ? '' : Number(e.target.value))}
-                        onKeyDown={e => { if (e.key === 'Enter') handlePerformCheck(); }}
-                      />
-                    </div>
-
-                    <button
-                      onClick={handlePerformCheck}
-                      className="w-full py-3 rounded-xl bg-cyan-600 hover:bg-cyan-500 font-bold text-sm transition active:scale-[0.99]"
-                    >
-                      掷 1D100
-                    </button>
-                  </>
-                )}
-
-                {rollTab === 'custom' && (
-                  <>
-                    <div>
-                      <h3 className="text-base font-bold flex items-center gap-2">
-                        <span>🎲</span> 自由掷骰
-                      </h3>
-                      <p className="text-xs text-slate-500 mt-1.5">
-                        {isCreator
-                          ? '守秘人身份掷骰，无需绑定角色'
-                          : '以当前角色身份掷骰，结果全房可见'}
-                      </p>
-                    </div>
-
-                    <input
-                      type="text"
-                      placeholder="掷骰目的（可选），如：先攻 / 敌人数目"
-                      className="w-full bg-slate-900/70 border border-slate-700 rounded-xl px-4 py-3 text-sm outline-none focus:border-cyan-500 transition"
-                      value={freeLabel}
-                      onChange={e => setFreeLabel(e.target.value)}
-                    />
-
-                    {/* 骰子组配置 */}
-                    <div className="space-y-2">
-                      <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest">
-                        掷骰组合
-                      </label>
-                      {freeDiceGroups.map((group, index) => (
-                        <div key={index} className="flex items-center gap-2">
-                          <input
-                            type="number"
-                            min={1}
-                            className="w-full h-11 text-center text-base font-black bg-slate-900/70 border border-slate-700 rounded-xl outline-none focus:border-cyan-500"
-                            value={group.count}
-                            onChange={e => updateFreeGroup(index, 'count', Number(e.target.value))}
-                          />
-                          <span className="font-serif italic text-base text-slate-500">D</span>
-                          <input
-                            type="number"
-                            min={1}
-                            className="w-full h-11 text-center text-base font-black bg-slate-900/70 border border-slate-700 rounded-xl outline-none focus:border-cyan-500"
-                            value={group.sides}
-                            onChange={e => updateFreeGroup(index, 'sides', Number(e.target.value))}
-                            onKeyDown={e => { if (e.key === 'Enter') handleFreeRoll(); }}
-                          />
-                          {freeDiceGroups.length > 1 && (
-                            <button
-                              onClick={() => removeFreeGroup(index)}
-                              className="text-slate-500 hover:text-red-400 px-1 text-sm"
-                            >
-                              ✕
-                            </button>
-                          )}
-                        </div>
-                      ))}
-                      {freeDiceGroups.length < 3 && (
-                        <button
-                          onClick={addFreeGroup}
-                          className="w-full py-1.5 border border-dashed border-slate-700 rounded-xl text-slate-500 text-[10px] font-bold uppercase hover:bg-slate-900/40"
-                        >
-                          + 添加骰子组
-                        </button>
-                      )}
-                    </div>
-
-                    <div>
-                      <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest">
-                        额外加值 Bonus
-                      </label>
-                      <input
-                        type="number"
-                        className="mt-1.5 w-full h-11 px-4 text-base font-black bg-slate-900/70 border border-slate-700 rounded-xl outline-none focus:border-cyan-500"
-                        value={freeBonus}
-                        onChange={e => setFreeBonus(e.target.value === '' ? 0 : Number(e.target.value))}
-                        onKeyDown={e => { if (e.key === 'Enter') handleFreeRoll(); }}
-                      />
-                    </div>
-
-                    <button
-                      onClick={handleFreeRoll}
-                      className="w-full py-3 rounded-xl bg-cyan-600 hover:bg-cyan-500 font-bold text-sm transition active:scale-[0.99]"
-                    >
-                      掷骰
-                    </button>
-                  </>
-                )}
+          {/* 自由掷骰：两行布局（目的 + 加值 + 按钮 / 骰子组） */}
+          {rollTab === 'custom' && (
+            <div className="flex-1 min-h-0 flex flex-col justify-center gap-2.5">
+              <div className="flex items-center gap-2">
+                <input
+                  type="text"
+                  placeholder="掷骰目的（可选），如：先攻 / 敌人数目"
+                  className="flex-1 bg-slate-900/70 border border-slate-700 rounded-xl px-4 py-2.5 text-sm outline-none focus:border-cyan-500 transition"
+                  value={freeLabel}
+                  onChange={e => setFreeLabel(e.target.value)}
+                />
+                <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest flex-shrink-0">加值</span>
+                <input
+                  type="number"
+                  className="w-24 bg-slate-900/70 border border-slate-700 rounded-xl px-3 py-2.5 text-sm font-bold outline-none focus:border-cyan-500"
+                  value={freeBonus}
+                  onChange={e => setFreeBonus(e.target.value === '' ? 0 : Number(e.target.value))}
+                  onKeyDown={e => { if (e.key === 'Enter') handleFreeRoll(); }}
+                />
+                <button
+                  onClick={handleFreeRoll}
+                  className="px-6 py-2.5 rounded-xl bg-cyan-600 hover:bg-cyan-500 font-bold text-sm transition active:scale-[0.99] flex-shrink-0"
+                >
+                  掷骰
+                </button>
               </div>
 
-              {isCreator && !kpCanCheck && (
-                <p className="text-[11px] text-amber-500/70 text-center mt-4 leading-relaxed">
-                  检定类掷骰必须绑定角色。导入 NPC / 怪物并加入房间后，
-                  即可在「技能检定」中选择代掷对象。
-                </p>
-              )}
-            </div>
-          </main>
-
-          {/* 共享掷骰 / 消息日志（聊天记录式） */}
-          <aside className="w-96 flex-shrink-0 border-l border-slate-700 bg-slate-800/40 flex flex-col">
-            <div className="px-4 py-3 border-b border-slate-700 flex items-center gap-2">
-              <span>📜</span>
-              <span className="font-bold text-sm">掷骰记录</span>
-              <span className="text-xs text-slate-500 ml-auto">{diceLogs.length}</span>
-            </div>
-
-            <div ref={logListRef} className="flex-1 overflow-y-auto p-4 space-y-4">
-              {diceLogs.length === 0 && (
-                <p className="text-center text-slate-600 text-xs py-10 italic">
-                  暂无掷骰记录，等待第一掷…
-                </p>
-              )}
-
-              {diceLogs.map(log => {
-                const sender = currentRoom.members.find(m => m.user_id === log.user_id);
-                const senderName = isCreator && log.user_id === currentRoom.creator_id
-                  ? '守秘人'
-                  : (log.char_name || sender?.profile?.display_name || '未知');
-                const isCheckType = log.msg_type === 'check' || log.msg_type === 'hidden';
-
-                return (
-                  <div key={log.id} className="flex gap-3">
-                    <div className="w-9 h-9 rounded-full bg-slate-700 flex items-center justify-center text-xs font-bold flex-shrink-0 overflow-hidden">
-                      {sender?.profile?.avatar_url ? (
-                        <img src={sender.profile.avatar_url} alt="" className="w-full h-full object-cover" />
-                      ) : (
-                        <span>{senderName[0]}</span>
-                      )}
-                    </div>
-
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2">
-                        <span className="text-xs font-bold text-slate-200 truncate">{senderName}</span>
-                        {log.msg_type === 'hidden' && (
-                          <span className="px-1.5 py-0.5 bg-purple-600/80 rounded text-[9px] font-bold">暗骰</span>
-                        )}
-                        <span className="text-[10px] text-slate-500 ml-auto flex-shrink-0">
-                          {formatLogTime(log.created_at)}
-                        </span>
-                      </div>
-
-                      <div className="mt-1.5 rounded-xl bg-slate-700/50 px-3.5 py-3">
-                        {isCheckType && log.roll !== null ? (
-                          <>
-                            <div className="flex items-baseline gap-2 flex-wrap">
-                              <span className="text-slate-300 text-sm">{log.label}</span>
-                              <span className="text-xl font-black text-white">{log.roll}</span>
-                              <span className="text-xs text-slate-400">/ {log.target}</span>
-                            </div>
-                            <div className={`text-xs font-black mt-1.5 ${getLevelClass(log.level)}`}>
-                              {log.level}
-                            </div>
-                          </>
-                        ) : log.msg_type === 'custom' ? (
-                          <>
-                            <div className="flex items-baseline gap-2">
-                              <span className="text-slate-300 text-sm">{log.label}</span>
-                              <span className="text-xl font-black text-cyan-300 ml-auto">{log.roll}</span>
-                            </div>
-                            <div className="text-[11px] text-slate-400 font-mono mt-1 break-all">
-                              {log.level}
-                            </div>
-                          </>
-                        ) : (
-                          <span className="text-sm text-slate-300">{log.label || log.level}</span>
-                        )}
-                      </div>
-                    </div>
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest flex-shrink-0">骰子组</span>
+                {freeDiceGroups.map((group, index) => (
+                  <div key={index} className="flex items-center gap-1.5">
+                    <input
+                      type="number"
+                      min={1}
+                      className="w-16 h-10 text-center text-sm font-black bg-slate-900/70 border border-slate-700 rounded-xl outline-none focus:border-cyan-500"
+                      value={group.count}
+                      onChange={e => updateFreeGroup(index, 'count', Number(e.target.value))}
+                    />
+                    <span className="font-serif italic text-sm text-slate-500">D</span>
+                    <input
+                      type="number"
+                      min={1}
+                      className="w-16 h-10 text-center text-sm font-black bg-slate-900/70 border border-slate-700 rounded-xl outline-none focus:border-cyan-500"
+                      value={group.sides}
+                      onChange={e => updateFreeGroup(index, 'sides', Number(e.target.value))}
+                      onKeyDown={e => { if (e.key === 'Enter') handleFreeRoll(); }}
+                    />
+                    {freeDiceGroups.length > 1 && (
+                      <button
+                        onClick={() => removeFreeGroup(index)}
+                        className="text-slate-500 hover:text-red-400 px-0.5 text-sm"
+                      >
+                        ✕
+                      </button>
+                    )}
                   </div>
-                );
-              })}
+                ))}
+                {freeDiceGroups.length < 3 && (
+                  <button
+                    onClick={addFreeGroup}
+                    className="px-3 py-1.5 border border-dashed border-slate-700 rounded-xl text-slate-500 hover:text-cyan-400 text-[10px] font-bold"
+                  >
+                    + 添加骰子组
+                  </button>
+                )}
+              </div>
             </div>
-          </aside>
+          )}
         </div>
       </div>
 
+      {/* LOGS 悬浮按钮：页面最右缘垂直居中，点击展开掷骰记录侧栏 */}
+      {!logsOpen && (
+        <button
+          onClick={() => { setLogsOpen(true); setLogsTouched(false); }}
+          title="掷骰记录"
+          className="fixed right-0 top-1/2 -translate-y-1/2 z-40 bg-slate-800/90 hover:bg-slate-700 border border-r-0 border-slate-600 rounded-l-lg px-1 py-5 shadow-lg transition"
+        >
+          <span
+            className="text-[10px] font-black tracking-[0.35em] text-cyan-400"
+            style={{ writingMode: 'vertical-rl' }}
+          >
+            LOGS
+          </span>
+        </button>
+      )}
+
+      {/* 掷骰记录悬浮侧栏：默认半透明覆盖在页面之上，点击面板内部转为不透明；
+          不加全屏遮罩，面板之外的页面交互不受影响 */}
+      {logsOpen && (
+        <aside
+          onClick={() => setLogsTouched(true)}
+          className={`fixed right-0 top-1/2 -translate-y-1/2 z-50 w-[420px] max-w-[92vw] h-[82vh] rounded-l-2xl border border-r-0 border-slate-700 flex flex-col shadow-2xl transition-colors duration-200 ${
+            logsTouched ? 'bg-slate-900' : 'bg-slate-900/70'
+          }`}
+        >
+          {/* 头部：标题 + 笔记 / 导出 / 关闭 */}
+          <div className="px-4 py-3 border-b border-slate-700 flex items-center gap-2 flex-shrink-0">
+            <span>📜</span>
+            <span className="font-bold text-sm">掷骰记录</span>
+            <span className="text-[10px] text-slate-500">{diceLogs.length}</span>
+            <div className="ml-auto flex items-center gap-1.5">
+              <button
+                onClick={() => setNoteModalOpen(true)}
+                title="添加私有笔记（仅自己可见）"
+                className="px-2 py-1 rounded-md bg-slate-800 hover:bg-slate-700 border border-slate-700 text-[10px] font-bold text-cyan-300 transition"
+              >
+                ✏️ 笔记
+              </button>
+              <button
+                onClick={exportLogs}
+                title="导出为 TXT（含自己的笔记）"
+                className="px-2 py-1 rounded-md bg-slate-800 hover:bg-slate-700 border border-slate-700 text-[10px] font-bold text-cyan-300 transition"
+              >
+                ⬇ EXPORT TXT
+              </button>
+              <button
+                onClick={() => setLogsOpen(false)}
+                title="收起"
+                className="w-6 h-6 rounded-md text-slate-400 hover:text-white hover:bg-slate-700 transition text-sm leading-none"
+              >
+                ✕
+              </button>
+            </div>
+          </div>
+
+          {/* 日志列表（单机版卡片式渲染） */}
+          <div ref={logListRef} className="flex-1 overflow-y-auto p-3 space-y-2">
+            {diceLogs.length === 0 && (
+              <p className="text-center text-slate-600 text-xs py-10 italic">
+                暂无掷骰记录，等待第一掷…
+              </p>
+            )}
+
+            {diceLogs.map(log =>
+              renderLogCard(log, isCreator || (log.msg_type === 'note' && log.user_id === userId))
+            )}
+          </div>
+        </aside>
+      )}
+
+      {/* 掷骰结果悬浮提示：底部掷骰面板之上锚定堆叠——新骰子入队把先出现的顶上去；
+          左上角圆环为 6 秒剩余时间，点击提示可展开完整记录侧栏 */}
+      <div className="fixed right-6 bottom-[calc(33vh+1.25rem)] z-[45] w-[420px] max-w-[80vw] flex flex-col gap-2 pointer-events-none">
+        {rollToasts.map(log => (
+          <div
+            key={log.id}
+            className="dice-toast-in pointer-events-auto relative shadow-xl rounded-lg cursor-pointer"
+            onClick={() => { setLogsOpen(true); setLogsTouched(false); }}
+          >
+            {renderLogCard(log, false)}
+            <div className="absolute -top-1.5 -left-1.5 w-5 h-5 text-cyan-400 drop-shadow">
+              <svg viewBox="0 0 16 16" className="w-full h-full -rotate-90">
+                <circle cx="8" cy="8" r="6.5" fill="none" stroke="currentColor" strokeOpacity="0.25" strokeWidth="2" />
+                <circle
+                  cx="8"
+                  cy="8"
+                  r="6.5"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeDasharray="40.84"
+                  className="dice-toast-ring"
+                />
+              </svg>
+            </div>
+          </div>
+        ))}
+      </div>
+
       {Dialog}
+
+      {/* 添加私有笔记弹窗（仅自己可见，可随记录导出 TXT） */}
+      {noteModalOpen && (
+        <div
+          className="fixed inset-0 z-[70] flex items-center justify-center bg-slate-900/60 backdrop-blur-sm p-4"
+          onClick={() => { if (!noteBusy) setNoteModalOpen(false); }}
+        >
+          <div
+            className="bg-slate-800 border border-slate-700 rounded-2xl shadow-2xl w-full max-w-md overflow-hidden"
+            onClick={e => e.stopPropagation()}
+          >
+            <div className="p-4 border-b border-slate-700 flex justify-between items-center">
+              <h3 className="font-bold text-white">📝 添加剧情笔记</h3>
+              <button
+                onClick={() => setNoteModalOpen(false)}
+                disabled={noteBusy}
+                className="text-slate-400 hover:text-white disabled:opacity-50"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="p-4">
+              <p className="text-[11px] text-slate-500 mb-2">
+                笔记仅自己可见，其他成员无法查看；会出现在你的记录列表中，并可随记录一并导出 TXT。
+              </p>
+              <textarea
+                autoFocus
+                value={noteText}
+                onChange={e => setNoteText(e.target.value)}
+                placeholder="在此输入剧情描述、个人备忘或关键线索..."
+                className="w-full h-36 p-3 bg-slate-900/70 border border-slate-700 rounded-xl text-sm text-white outline-none focus:border-cyan-500 resize-none transition"
+              />
+
+              <div className="mt-4 flex gap-3">
+                <button
+                  onClick={() => setNoteModalOpen(false)}
+                  disabled={noteBusy}
+                  className="flex-1 py-2.5 rounded-xl font-bold text-slate-400 hover:bg-slate-700 transition disabled:opacity-50"
+                >
+                  取消
+                </button>
+                <button
+                  onClick={handleSaveNote}
+                  disabled={noteBusy}
+                  className="flex-[2] py-2.5 bg-cyan-600 hover:bg-cyan-500 text-white rounded-xl font-bold transition disabled:opacity-50"
+                >
+                  {noteBusy ? '保存中...' : '保存并记录'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* KP 添加 NPC / 怪物弹窗（由侧栏虚线加号框打开，类型由所在分区决定） */}
+      {npcImportType && (
+        <NpcImportModal
+          userId={userId}
+          roomId={currentRoom.id}
+          addType={npcImportType}
+          onClose={() => setNpcImportType(null)}
+        />
+      )}
+
+      {/* 角色卡查看浮窗：点击左侧角色栏的 PC/NPC/怪物打开（NPC/怪物仅 KP 可打开）。
+          PC 卡：KP 端带揭示控件；其他 PL 端按房规 + 已揭示分区过滤；自己的卡完整可见 */}
+      {viewCard && (() => {
+        const ownerMember = currentRoom.members.find(
+          m => m.role === 'pl' && m.character_id === viewCard.id
+        );
+        const rules = rulesFromRoom(currentRoom);
+        const revealed = ownerMember ? revealedFromMember(ownerMember.revealed_sections) : [];
+
+        // KP 打开 PC 卡：当前对玩家隐藏的分区显示“揭示给玩家”
+        const kpReveal = isCreator && ownerMember
+          ? {
+              hiddenFromPlayers: (Object.keys(rules.card_sections) as CardSection[])
+                .filter(k => !rules.card_sections[k] && !revealed.includes(k)),
+              onReveal: handleRevealSection(ownerMember.id, viewCard.name),
+            }
+          : undefined;
+
+        // PL 打开他人 PC 卡：按有效可见性过滤；自己的卡 / NPC / 怪物无限制
+        const visibleSections = !isCreator && ownerMember && ownerMember.user_id !== userId
+          ? sectionsForViewer(rules, revealed)
+          : undefined;
+
+        // PL 查看自己的卡：内容完整显示，但当前对其他 PL 隐藏的分区用橙色小字标注
+        // （KP 已揭示的分区对其他人已可见，不再标注）
+        const hiddenForOthers = !isCreator && ownerMember && ownerMember.user_id === userId
+          ? (Object.keys(rules.card_sections) as CardSection[])
+              .filter(k => !rules.card_sections[k] && !revealed.includes(k))
+          : undefined;
+
+        return (
+          <CharacterCardModal
+            character={viewCard}
+            onClose={() => setViewCard(null)}
+            visibleSections={visibleSections}
+            kpReveal={kpReveal}
+            hiddenForOthers={hiddenForOthers}
+          />
+        );
+      })()}
 
       {/* KP 修改房间名弹窗 */}
       {renameModalOpen && (
@@ -1074,6 +1586,120 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
                 取消
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* 房间信息弹窗：点击头部房间号方框打开（KP/PL 均可），展示创建时确定的房规 */}
+      {rulesInfoOpen && (() => {
+        const rules = rulesFromRoom(currentRoom);
+        return (
+          <div
+            className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-900/60 backdrop-blur-sm p-4"
+            onClick={() => setRulesInfoOpen(false)}
+          >
+            <div
+              className="w-full max-w-md bg-slate-800 rounded-2xl shadow-2xl border border-slate-700 p-6 max-h-[85vh] overflow-y-auto"
+              onClick={e => e.stopPropagation()}
+            >
+              <h2 className="text-xl font-bold text-center text-cyan-400 mb-1">房间信息</h2>
+              <p className="text-center text-xs text-slate-500 mb-5">「{currentRoom.name}」</p>
+
+              {/* PC 角色卡初始可见性 */}
+              <div className="text-xs text-slate-500 mb-1.5">PC 角色卡可见性（初始）</div>
+              <div className="flex flex-wrap gap-1.5 mb-5">
+                <span className="text-[10px] px-2 py-0.5 rounded-full border font-bold bg-cyan-900/40 border-cyan-700 text-cyan-300">
+                  ✓ 头像与姓名
+                </span>
+                {CARD_SECTION_OPTIONS.map(o => (
+                  <span
+                    key={o.key}
+                    className={`text-[10px] px-2 py-0.5 rounded-full border font-bold ${
+                      rules.card_sections[o.key]
+                        ? 'bg-cyan-900/40 border-cyan-700 text-cyan-300'
+                        : 'bg-slate-800/60 border-slate-700 text-slate-500'
+                    }`}
+                  >
+                    {rules.card_sections[o.key] ? '✓' : '✕'} {o.label}
+                  </span>
+                ))}
+              </div>
+
+              {/* 可选规则 */}
+              <div className="grid grid-cols-2 gap-2 mb-4">
+                <div className="flex items-center justify-between bg-slate-900/60 border border-slate-700 rounded-lg px-2.5 py-1.5">
+                  <span className="text-xs text-slate-400">孤注一掷</span>
+                  <span className={`text-xs font-bold ${rules.enable_push ? 'text-emerald-400' : 'text-slate-600'}`}>
+                    {rules.enable_push ? '启用' : '未启用'}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between bg-slate-900/60 border border-slate-700 rounded-lg px-2.5 py-1.5">
+                  <span className="text-xs text-slate-400">燃烧幸运</span>
+                  <span className={`text-xs font-bold ${rules.enable_burn_luck ? 'text-emerald-400' : 'text-slate-600'}`}>
+                    {rules.enable_burn_luck ? '启用' : '未启用'}
+                  </span>
+                </div>
+              </div>
+
+              {/* 阈值 */}
+              <div className="flex items-center justify-center gap-4 text-xs mb-5">
+                <span className="text-slate-400">
+                  大成功 <b className="text-emerald-400 text-sm">≤ {rules.crit_threshold}</b>
+                </span>
+                <span className="text-slate-700">|</span>
+                <span className="text-slate-400">
+                  大失败 <b className="text-red-400 text-sm">≥ {rules.fumble_threshold}</b>
+                </span>
+              </div>
+
+              <button
+                onClick={() => setRulesInfoOpen(false)}
+                className="w-full py-2.5 bg-slate-700 hover:bg-slate-600 rounded-xl text-slate-200 text-sm font-bold transition"
+              >
+                关闭
+              </button>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* KP 设置弹窗：暂停房间 / 删除房间 / 管理成员 */}
+      {roomSettingsOpen && (
+        <div
+          className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-900/60 backdrop-blur-sm p-4"
+          onClick={() => setRoomSettingsOpen(false)}
+        >
+          <div
+            className="w-full max-w-sm bg-slate-800 rounded-2xl shadow-2xl border border-slate-700 p-6"
+            onClick={e => e.stopPropagation()}
+          >
+            <h2 className="text-xl font-bold text-center text-cyan-400 mb-5">房间设置</h2>
+            <div className="space-y-2.5">
+              <button
+                onClick={() => { setRoomSettingsOpen(false); setManageMembersModal(true); }}
+                className="w-full py-3 bg-slate-700 hover:bg-slate-600 rounded-xl font-bold transition text-sm"
+              >
+                👥 管理成员
+              </button>
+              <button
+                onClick={() => { setRoomSettingsOpen(false); handlePauseRoom(); }}
+                className="w-full py-3 bg-amber-600 hover:bg-amber-500 rounded-xl font-bold transition text-sm"
+              >
+                ⏸ 暂停房间
+              </button>
+              <button
+                onClick={() => { setRoomSettingsOpen(false); handleDeleteRoom(); }}
+                className="w-full py-3 bg-red-800 hover:bg-red-500 rounded-xl font-bold transition text-sm"
+              >
+                🗑 删除房间
+              </button>
+            </div>
+            <button
+              onClick={() => setRoomSettingsOpen(false)}
+              className="w-full py-2 text-slate-400 hover:text-slate-200 text-sm mt-4 transition"
+            >
+              取消
+            </button>
           </div>
         </div>
       )}

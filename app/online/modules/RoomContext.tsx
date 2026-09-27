@@ -31,6 +31,8 @@ interface RoomContextType {
   diceLogs: DiceLog[];
   performCheck: (input: PerformCheckInput) => Promise<void>;
   performCustomRoll: (input: PerformCustomInput) => Promise<void>;
+  // 向当前房间频道广播任意事件（KP 操作通知等；不受 RLS 限制）
+  broadcastToRoom: (event: string, payload?: Record<string, any>) => Promise<void>;
 }
 
 const RoomContext = createContext<RoomContextType | null>(null);
@@ -95,7 +97,7 @@ export function RoomProvider({ userId, children }: { userId: string; children: R
     );
 
     // 监听 dice_logs 新增（掷骰 / 消息实时同步，聊天记录式追加）
-    // hidden 暗骰行由 RLS 过滤，PL 客户端根本收不到
+    // hidden 暗骰行由 RLS 过滤，PL 客户端根本收不到；note 笔记行同理只有作者能收到
     channel.on(
       'postgres_changes',
       { event: 'INSERT', schema: 'public', table: 'dice_logs' },
@@ -104,6 +106,39 @@ export function RoomProvider({ userId, children }: { userId: string; children: R
         if (!row || row.room_id !== roomId) return;
         console.log('[setupRoomChannel] dice_logs INSERT:', { id: row.id, msg_type: row.msg_type });
         setDiceLogs(prev => (prev.some(l => l.id === row.id) ? prev : [...prev, row]));
+      }
+    );
+
+    // 监听 dice_logs 删除（KP 删除单条掷骰记录，实时从所有客户端移除）
+    channel.on(
+      'postgres_changes',
+      { event: 'DELETE', schema: 'public', table: 'dice_logs' },
+      (payload) => {
+        const oldRow = (payload as any).old as { id?: string; room_id?: string } | null;
+        if (!oldRow?.id || (oldRow.room_id && oldRow.room_id !== roomId)) return;
+        console.log('[setupRoomChannel] dice_logs DELETE:', { id: oldRow.id });
+        setDiceLogs(prev => prev.filter(l => l.id !== oldRow.id));
+      }
+    );
+
+    // 监听广播事件：dice_log_deleted（删除单条记录的广播兜底，
+    // 补充 postgres_changes DELETE 事件在部分环境下不到达其它端的问题）
+    channel.on('broadcast', { event: 'dice_log_deleted' }, (payload) => {
+      const deletedId = (payload.payload as any)?.id as string | undefined;
+      if (!deletedId) return;
+      console.log('[setupRoomChannel] 收到 dice_log_deleted 广播:', deletedId);
+      setDiceLogs(prev => prev.filter(l => l.id !== deletedId));
+    });
+
+    // 监听 room_npcs 变更（KP 导入 / 移除 NPC、怪物）：通知 RoomView 重新加载房间角色
+    channel.on(
+      'postgres_changes',
+      { event: '*', schema: 'public', table: 'room_npcs' },
+      (payload) => {
+        const row = ((payload as any).new || (payload as any).old) as { room_id?: string } | null;
+        if (!row || row.room_id !== roomId) return;
+        console.log('[setupRoomChannel] room_npcs changed:', (payload as any).eventType);
+        window.dispatchEvent(new CustomEvent('room-npcs-changed'));
       }
     );
 
@@ -117,6 +152,13 @@ export function RoomProvider({ userId, children }: { userId: string; children: R
     channel.on('broadcast', { event: 'room_paused' }, async () => {
       console.log('[setupRoomChannel] 收到 room_paused 广播');
       window.dispatchEvent(new CustomEvent('room-paused'));
+    });
+
+    // 监听广播事件：room_npcs_changed（KP 切换 NPC/怪物在场状态，
+    // 补充 postgres_changes 在行离开 RLS 可见集合时不推送的问题）
+    channel.on('broadcast', { event: 'room_npcs_changed' }, async () => {
+      console.log('[setupRoomChannel] 收到 room_npcs_changed 广播');
+      window.dispatchEvent(new CustomEvent('room-npcs-changed'));
     });
 
     // 监听广播事件：room_update
@@ -245,6 +287,13 @@ export function RoomProvider({ userId, children }: { userId: string; children: R
     });
   }, [userId]);
 
+  // 向当前房间频道广播任意事件（用于 postgres_changes 因 RLS 丢事件的场景，
+  // 如怪物 visible true→false 后该行离开 PL 的可见集合）
+  const broadcastToRoom = useCallback(async (event: string, payload: Record<string, any> = {}): Promise<void> => {
+    if (!channelRef.current) throw new Error('当前不在房间中');
+    await channelRef.current.send({ type: 'broadcast', event, payload });
+  }, []);
+
   const loadRoom = useCallback(async (roomId: string): Promise<void> => {
     console.log('[loadRoom] 开始加载房间:', roomId);
     setLoading(true);
@@ -318,12 +367,16 @@ export function RoomProvider({ userId, children }: { userId: string; children: R
     try {
       const room = await roomService.joinRoom(userId, { room_code: roomCode, character_id: characterId });
       await loadRoom(room.id);
+      // 广播兜底：确保其他客户端立即重新拉取（含角色绑定/可见性），不依赖 postgres_changes 是否到达
+      await broadcastToRoom('room_update', { joinedUserId: userId }).catch(err => {
+        console.warn('[joinRoom] 广播失败（不影响加入）:', err);
+      });
     } catch (err: any) {
       setError(err.message || '加入房间失败');
       setLoading(false);
       throw err;
     }
-  }, [userId]);
+  }, [userId, loadRoom, broadcastToRoom]);
 
   const leaveRoom = useCallback(async (removeOthers = false): Promise<void> => {
     if (!currentRoom) {
@@ -590,6 +643,7 @@ export function RoomProvider({ userId, children }: { userId: string; children: R
     diceLogs,
     performCheck,
     performCustomRoll,
+    broadcastToRoom,
   };
 
   return <RoomContext.Provider value={value}>{children}</RoomContext.Provider>;

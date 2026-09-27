@@ -26,3 +26,22 @@ body {
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
 }
+
+/* 掷骰结果悬浮提示：进入动画 + 6 秒倒计时圆环 */
+@keyframes dice-toast-in {
+  from { opacity: 0; transform: translateX(28px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+.dice-toast-in {
+  animation: dice-toast-in 0.25s ease-out both;
+}
+
+@keyframes dice-toast-ring {
+  from { stroke-dashoffset: 0; }
+  to { stroke-dashoffset: 40.84; }  /* 2πr, r=6.5 */
+}
+
+.dice-toast-ring {
+  animation: dice-toast-ring 6s linear forwards;
+}

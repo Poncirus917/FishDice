@@ -4,13 +4,84 @@ import toast from 'react-hot-toast';
 import Swal from 'sweetalert2';
 import ImportView from './ImportView';
 import AvatarCropper from './AvatarCropper';
-import { encodeShareCode } from './shareCode';
-import { CharacterState } from '../../(single)/page';
+import { encodeShareCode, BG_FIELDS } from './shareCode';
+import { CharacterState, Weapon, WeaponDicePart, Spell } from '../../(single)/page';
 import { supabase } from '../../lib/supabase';
+import { calcDBAndBuild } from '../../utils/attributes';
 
 type SidebarTab = 'create' | 'pc' | 'npc' | 'mob';
 
 const ATTRIBUTE_NAMES = ['力量', '敏捷', '意志', '体质', '外貌', '教育', '体型', '智力', '幸运'];
+
+// 默认武器"肉搏"：所有角色自带，不可删除
+const DEFAULT_FIGHT_WEAPON: Weapon = {
+  name: '肉搏',
+  skill: '斗殴',
+  type: 'melee',
+  damage: [{ count: 1, sides: 3 }],
+  attacks: 1,
+  multi: false,
+  malfunction: null,
+};
+
+// 武器伤害骰子的可选面数
+const DICE_SIDES_OPTIONS = [3, 4, 6, 8, 10, 12, 20, 100];
+
+// 随身物品行数上限
+const POSSESSIONS_LIMIT = 20;
+
+// 格式化武器伤害为展示字符串（近战末尾追加 DB）
+const formatWeaponDamage = (w: Weapon): string => {
+  const parts = w.damage.map(d => `${d.count}D${d.sides}`);
+  if (w.type === 'melee') parts.push('DB');
+  return parts.join('+');
+};
+
+// 技能模糊匹配输入：只能选择 options 中存在的技能；输入文字后才显示候选（向上展开）
+function SkillAutocomplete({
+  value,
+  options,
+  onChange,
+}: {
+  value: string;
+  options: string[];
+  onChange: (v: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const hasInput = value.trim() !== '';
+  const filtered = options.filter(s => s.toLowerCase().includes(value.trim().toLowerCase()));
+  const invalid = hasInput && !options.includes(value.trim());
+  const showList = open && hasInput && filtered.length > 0;
+
+  return (
+    <div className="relative">
+      <input
+        type="text"
+        value={value}
+        placeholder="输入或选择技能"
+        onChange={e => { onChange(e.target.value); setOpen(true); }}
+        onFocus={() => { if (value.trim() !== '') setOpen(true); }}
+        onBlur={() => setOpen(false)}
+        className={`w-full bg-slate-900 border rounded-lg px-2 py-1.5 text-xs outline-none text-slate-100 placeholder-slate-600 ${
+          invalid ? 'border-red-600' : 'border-slate-700 focus:border-cyan-500'
+        }`}
+      />
+      {showList && (
+        <div className="absolute z-20 left-0 right-0 bottom-full mb-1 max-h-40 overflow-y-auto bg-slate-900 border border-slate-700 rounded-lg shadow-xl">
+          {filtered.map(s => (
+            <div
+              key={s}
+              onMouseDown={e => { e.preventDefault(); onChange(s); setOpen(false); }}
+              className="px-2 py-1.5 text-xs text-slate-300 hover:bg-slate-700 cursor-pointer"
+            >
+              {s}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
 
 export default function CharacterManager({ userId }: { userId: string }) {
   const [sidebarTab, setSidebarTab] = useState<SidebarTab>('pc');
@@ -59,7 +130,8 @@ export default function CharacterManager({ userId }: { userId: string }) {
         .single();
 
       if (error) {
-        toast.error('保存到服务器失败');
+        console.error('保存角色失败:', error);
+        toast.error(`保存到服务器失败: ${error.message || '未知错误'}`);
       } else if (data) {
         rowIdMap.current.set(newChar.id, data.id);
       }
@@ -342,6 +414,24 @@ function CharacterCard({ character, onClick }: { character: CharacterState; onCl
               </div>
             </div>
           ))}
+
+          {/* 伤害加值 / 体格：自动计算展示 */}
+          {(() => {
+            const dbBuild = calcDBAndBuild(character.attributes['力量'] || 0, character.attributes['体型'] || 0);
+            if (!dbBuild) return null;
+            return (
+              <>
+                <div className="bg-slate-900/50 rounded-xl p-3 text-center border border-slate-700/50">
+                  <div className="text-xs text-slate-500 mb-1">伤害加值</div>
+                  <div className={`text-lg font-bold ${colors.text}`}>{dbBuild.db}</div>
+                </div>
+                <div className="bg-slate-900/50 rounded-xl p-3 text-center border border-slate-700/50">
+                  <div className="text-xs text-slate-500 mb-1">体格</div>
+                  <div className={`text-lg font-bold ${colors.text}`}>{dbBuild.build}</div>
+                </div>
+              </>
+            );
+          })()}
         </div>
       )}
     </div>
@@ -371,6 +461,14 @@ function CharacterDetailView({
   const avatarFileRef = useRef<HTMLInputElement>(null);
   const [newSkillName, setNewSkillName] = useState("");
   const [newSkillValue, setNewSkillValue] = useState<number>(0);
+  // 武器编辑（老角色无 weapons 时初始化为默认"肉搏"）
+  const [editWeapons, setEditWeapons] = useState<Weapon[]>([]);
+  // 调查员背景 8 栏编辑
+  const [editBackgrounds, setEditBackgrounds] = useState<Record<string, string>>({});
+  // 随身物品编辑（上限 20 行）
+  const [editPossessions, setEditPossessions] = useState<string[]>([]);
+  // 法术编辑
+  const [editSpells, setEditSpells] = useState<Spell[]>([]);
 
   const typeColors = {
     pc: { accent: 'text-cyan-400', border: 'border-cyan-700', badge: 'bg-cyan-600', bg: 'bg-cyan-900/20', button: 'bg-cyan-700 hover:bg-cyan-600' },
@@ -387,6 +485,11 @@ function CharacterDetailView({
   const derivedHP = Math.floor(((editTempSkills["体质"] || 0) + (editTempSkills["体型"] || 0)) / 10);
   const derivedMP = Math.floor((editTempSkills["意志"] || 0) / 5);
   const derivedSAN = editTempSkills["意志"] || 0;
+  // 伤害加值 / 体格：由力量+体型自动计算，编辑时实时刷新
+  const derivedDBBuild = calcDBAndBuild(
+    (isEditing ? editTempSkills["力量"] : character.attributes["力量"]) || 0,
+    (isEditing ? editTempSkills["体型"] : character.attributes["体型"]) || 0
+  );
 
   const handleAvatarUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -433,15 +536,65 @@ function CharacterDetailView({
     setEditTempSkills(rest);
   };
 
-  const handleExport = () => {
+  // ---------- 武器编辑 ----------
+  const updateWeapon = (index: number, patch: Partial<Weapon>) => {
+    setEditWeapons(prev => prev.map((w, i) => (i === index ? { ...w, ...patch } : w)));
+  };
+  const updateWeaponDice = (wIndex: number, dIndex: number, patch: Partial<WeaponDicePart>) => {
+    setEditWeapons(prev => prev.map((w, i) => {
+      if (i !== wIndex) return w;
+      return { ...w, damage: w.damage.map((d, j) => (j === dIndex ? { ...d, ...patch } : d)) };
+    }));
+  };
+  const addWeaponDice = (wIndex: number) => {
+    setEditWeapons(prev => prev.map((w, i) => (
+      i === wIndex && w.damage.length < 3
+        ? { ...w, damage: [...w.damage, { count: 1, sides: 6 }] }
+        : w
+    )));
+  };
+  const removeWeaponDice = (wIndex: number, dIndex: number) => {
+    setEditWeapons(prev => prev.map((w, i) => (
+      i === wIndex ? { ...w, damage: w.damage.filter((_, j) => j !== dIndex) } : w
+    )));
+  };
+  const addWeapon = () => {
+    setEditWeapons(prev => prev.length < 6 ? [...prev, {
+      name: '', skill: '', type: 'melee', damage: [{ count: 1, sides: 6 }],
+      attacks: 1, multi: false, malfunction: null,
+    }] : prev);
+  };
+  const removeWeapon = (index: number) => {
+    setEditWeapons(prev => prev.filter((_, i) => i !== index));
+  };
+
+  // ---------- 背景栏 / 随身物品 / 法术编辑 ----------
+  const updateBackground = (field: string, value: string) =>
+    setEditBackgrounds(prev => ({ ...prev, [field]: value }));
+
+  const updatePossession = (index: number, value: string) =>
+    setEditPossessions(prev => prev.map((p, i) => (i === index ? value : p)));
+  const addPossession = () =>
+    setEditPossessions(prev => (prev.length < POSSESSIONS_LIMIT ? [...prev, ''] : prev));
+  const removePossession = (index: number) =>
+    setEditPossessions(prev => prev.filter((_, i) => i !== index));
+
+  const updateSpell = (index: number, patch: Partial<Spell>) =>
+    setEditSpells(prev => prev.map((s, i) => (i === index ? { ...s, ...patch } : s)));
+  const addSpell = () =>
+    setEditSpells(prev => [...prev, { name: '', cost: '', effect: '', note: '' }]);
+  const removeSpell = (index: number) =>
+    setEditSpells(prev => prev.filter((_, i) => i !== index));
+
+  const handleExport = async () => {
     try {
-      const code = encodeShareCode(character);
+      const code = await encodeShareCode(character);
       Swal.fire({
         title: "分享角色",
         html: `
           <div class="text-left text-sm text-slate-600 mb-3">
             将此分享码发给好友，他们可以导入该角色。<br/>
-            <span class="text-amber-600 font-bold">注意：</span> PC/NPC 角色导入后将变为 NPC；怪物导入后仍为怪物。
+            <span class="text-amber-600 font-bold">注意：</span> PC 可由好友选择以 PC 或 NPC 身份导入；NPC/怪物导入后保持原身份。
           </div>
           <textarea id="share-code" class="w-full p-3 border-2 border-slate-300 rounded-xl text-xs font-mono bg-slate-50 text-slate-800 select-all" rows="4" readonly>${code}</textarea>
         `,
@@ -480,17 +633,52 @@ function CharacterDetailView({
     }).then((result) => {
       if (!result.isConfirmed) return;
 
+      // 武器校验：名称非空、伤害至少一段、使用技能必须在技能列表中（默认武器"肉搏"除外）
+      const skillKeys = Object.keys(editTempSkills).filter(k => !allAttrs.includes(k));
+      for (let i = 1; i < editWeapons.length; i++) {
+        const w = editWeapons[i];
+        if (!w.name.trim()) {
+          Swal.fire({ icon: 'error', title: '武器名称不能为空', text: `第 ${i + 1} 行武器缺少名称。` });
+          return;
+        }
+        if (!w.damage || w.damage.length === 0) {
+          Swal.fire({ icon: 'error', title: '武器伤害不能为空', text: `武器「${w.name}」至少需要一段伤害骰子。` });
+          return;
+        }
+        if (!skillKeys.includes(w.skill.trim())) {
+          Swal.fire({
+            icon: 'error',
+            title: '使用技能不存在',
+            text: `武器「${w.name}」的使用技能「${w.skill || '空'}」不在技能列表中，请修改。`,
+          });
+          return;
+        }
+      }
+
+      // 法术校验：法术名称不可为空
+      for (let i = 0; i < editSpells.length; i++) {
+        if (!editSpells[i].name.trim()) {
+          Swal.fire({ icon: 'error', title: '法术名称不能为空', text: `第 ${i + 1} 行法术缺少名称。` });
+          return;
+        }
+      }
+
       const con = clamp(editTempSkills["体质"] || 0);
       const siz = clamp(editTempSkills["体型"] || 0);
       const pow = clamp(editTempSkills["意志"] || 0);
       const isMob = character.type === 'mob';
 
-      const finalHP = isMob 
+      const finalHP = isMob
         ? clamp(editTempSkills["体力（HP）"] || 0)
         : Math.floor((con + siz) / 10);
-      const finalMP = isMob 
+      const finalMP = isMob
         ? clamp(editTempSkills["魔法（MP）"] || 0)
         : Math.floor(pow / 5);
+
+      // 第一行强制为默认武器"肉搏"（不可删除、不可修改）
+      const finalWeapons: Weapon[] = editWeapons.length
+        ? editWeapons.map((w, i) => (i === 0 ? { ...DEFAULT_FIGHT_WEAPON } : w))
+        : [DEFAULT_FIGHT_WEAPON];
 
       const updated: CharacterState = {
         ...character,
@@ -516,6 +704,13 @@ function CharacterDetailView({
           "体型": siz,
           "智力": clamp(editTempSkills["智力"] || 0),
         },
+        // 怪物不使用武器/法术，PC 专属人物设定；非对应类型保存时清除
+        ...(character.type !== 'mob'
+          ? { weapons: finalWeapons, spells: editSpells.map(s => ({ ...s, name: s.name.trim() })).filter(s => s.name !== '') }
+          : { weapons: undefined, spells: undefined }),
+        ...(character.type === 'pc'
+          ? { backgrounds: editBackgrounds, possessions: editPossessions.map(p => p.trim()).filter(p => p !== '') }
+          : { backgrounds: undefined, possessions: undefined }),
       };
 
       onUpdate(updated);
@@ -528,7 +723,17 @@ function CharacterDetailView({
     setEditName(character.name);
     setEditStory(character.story || "");
     setEditAvatar(character.avatar || null);
-    setEditTempSkills({ ...character.attributes, ...character.skills });
+    // 幸运的当前值存在 character.luck.current（燃烧幸运等会改变），
+    // 老角色/导入角色的 attributes 里可能没有"幸运"键，必须用 luck.current 初始化，否则保存会归 0
+    setEditTempSkills({
+      ...character.attributes,
+      ...character.skills,
+      '幸运': character.luck?.current ?? character.attributes['幸运'] ?? 0,
+    });
+    setEditWeapons(character.weapons?.length ? character.weapons : [DEFAULT_FIGHT_WEAPON]);
+    setEditBackgrounds({ ...(character.backgrounds || {}) });
+    setEditPossessions([...(character.possessions || [])]);
+    setEditSpells([...(character.spells || [])]);
     setIsEditing(true);
   };
 
@@ -550,6 +755,9 @@ function CharacterDetailView({
         setEditStory(character.story || "");
         setEditAvatar(character.avatar || null);
         setEditTempSkills({ ...character.attributes, ...character.skills });
+        setEditBackgrounds({ ...(character.backgrounds || {}) });
+        setEditPossessions([...(character.possessions || [])]);
+        setEditSpells([...(character.spells || [])]);
       }
     });
   };
@@ -642,12 +850,100 @@ function CharacterDetailView({
             )}
           </div>
         </div>
+
+        {/* 背景与随身物品：仅 PC 类型显示（PC 导入为 NPC / NPC / 怪物不显示人物设定） */}
+        {character.type === 'pc' && (
+        <div className={`${colors.bg} px-6 pb-6 grid grid-cols-1 md:grid-cols-2 gap-6`}>
+          {/* 左：调查员背景（竖排 8 栏，输入框高度随内容自适应） */}
+          <div className="space-y-3">
+            {BG_FIELDS.map(field => (
+              <div key={field}>
+                <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest block mb-1">
+                  {field}
+                </label>
+                {isEditing ? (
+                  <textarea
+                    value={editBackgrounds[field] || ''}
+                    onChange={e => updateBackground(field, e.target.value)}
+                    placeholder="未填写"
+                    rows={1}
+                    className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-xs outline-none text-slate-100 placeholder-slate-600 focus:border-cyan-500 field-sizing-content min-h-[38px] max-h-48"
+                  />
+                ) : (
+                  <div className="bg-slate-900/50 border border-slate-700 rounded-xl px-3 py-2 text-xs text-slate-300 whitespace-pre-wrap leading-relaxed min-h-[38px]">
+                    {character.backgrounds?.[field] || <span className="text-slate-600 italic">未填写</span>}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+
+          {/* 右：随身物品（自由添加多行，上限 20） */}
+          <div>
+            {(() => {
+              const possessions = isEditing ? editPossessions : (character.possessions || []);
+              return (
+                <>
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest">
+                      随身物品 <span className="text-slate-600 normal-case font-normal">(最多 {POSSESSIONS_LIMIT} 行)</span>
+                    </label>
+                    {isEditing && possessions.length < POSSESSIONS_LIMIT && (
+                      <button
+                        onClick={addPossession}
+                        className="bg-cyan-600 text-white px-2.5 py-1 rounded-lg text-[10px] font-bold hover:bg-cyan-500 transition-colors"
+                      >
+                        + 添加物品
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="space-y-1.5">
+                    {possessions.length === 0 && (
+                      <div className="rounded-xl border border-dashed border-slate-700 px-3 py-4 text-center text-xs text-slate-600 italic">
+                        暂无随身物品
+                      </div>
+                    )}
+                    {possessions.map((p, i) => (
+                      <div key={i} className="flex items-center gap-1.5">
+                        <span className="text-slate-600 text-[10px] w-5 text-right flex-shrink-0">{i + 1}.</span>
+                        {isEditing ? (
+                          <>
+                            <input
+                              type="text"
+                              value={p}
+                              placeholder="物品名称 / 数量 / 备注"
+                              onChange={e => updatePossession(i, e.target.value)}
+                              className="flex-1 bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs outline-none text-slate-100 placeholder-slate-600 focus:border-cyan-500"
+                            />
+                            <button
+                              onClick={() => removePossession(i)}
+                              className="text-slate-500 hover:text-red-400 text-sm flex-shrink-0"
+                              title="删除该行"
+                            >
+                              ✕
+                            </button>
+                          </>
+                        ) : (
+                          <div className="flex-1 bg-slate-900/50 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-slate-300 whitespace-pre-wrap">
+                            {p}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </>
+              );
+            })()}
+          </div>
+        </div>
+        )}
       </div>
 
       {/* 下侧：数值 */}
       <div className="bg-slate-800 rounded-2xl border border-slate-700 p-6">
         <h4 className="text-sm font-bold text-slate-400 mb-4 uppercase tracking-wider">核心数值</h4>
-        
+
         <div className="grid grid-cols-3 sm:grid-cols-5 lg:grid-cols-6 gap-3 mb-6">
           {allAttrs.map(attr => {
             const isDerived = character.type === 'mob' 
@@ -696,6 +992,20 @@ function CharacterDetailView({
               </div>
             );
           })}
+
+          {/* 伤害加值 / 体格：由力量+体型自动计算，不可编辑 */}
+          <div className="p-3 rounded-xl border text-center bg-slate-900 border-slate-600">
+            <div className="text-xs font-bold mb-1 text-cyan-400">伤害加值</div>
+            <div className="text-lg font-bold text-cyan-400">
+              {derivedDBBuild ? derivedDBBuild.db : '—'}
+            </div>
+          </div>
+          <div className="p-3 rounded-xl border text-center bg-slate-900 border-slate-600">
+            <div className="text-xs font-bold mb-1 text-cyan-400">体格</div>
+            <div className="text-lg font-bold text-cyan-400">
+              {derivedDBBuild ? derivedDBBuild.build : '—'}
+            </div>
+          </div>
         </div>
 
         {/* 技能列表 */}
@@ -765,6 +1075,348 @@ function CharacterDetailView({
             )}
           </>
         )}
+
+        {/* 武器列表（最多 6 把，默认"肉搏"不可删除/修改；怪物不使用武器） */}
+        {character.type !== 'mob' && (() => {
+          const weapons: Weapon[] = isEditing
+            ? editWeapons
+            : (character.weapons?.length ? character.weapons : [DEFAULT_FIGHT_WEAPON]);
+          const skillKeys = Object.keys(editTempSkills).filter(k => !allAttrs.includes(k));
+          const tableHeaders = ['武器名称', '使用技能', '类型', '伤害', '次数', '对多', '故障值'];
+
+          return (
+            <>
+              <div className="flex items-center justify-between mb-3">
+                <h4 className="text-sm font-bold text-slate-400 uppercase tracking-wider">
+                  武器 <span className="text-slate-600 normal-case font-normal">({weapons.length}/6)</span>
+                </h4>
+                {isEditing && weapons.length < 6 && (
+                  <button
+                    onClick={addWeapon}
+                    className="bg-cyan-600 text-white px-3 py-1.5 rounded-lg text-xs font-bold hover:bg-cyan-500 transition-colors"
+                  >
+                    + 添加武器
+                  </button>
+                )}
+              </div>
+
+              <div className="overflow-x-auto rounded-xl border border-slate-700">
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr className="bg-slate-900/80 text-slate-500">
+                      {tableHeaders.map(h => (
+                        <th key={h} className="px-2 py-2 text-left font-bold whitespace-nowrap">{h}</th>
+                      ))}
+                      {isEditing && <th className="px-2 py-2 text-left font-bold">操作</th>}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {weapons.map((w, wi) => {
+                      const isDefault = wi === 0 && !isEditing ? w.name === '肉搏' : wi === 0;
+                      return (
+                        <tr key={wi} className={`border-t border-slate-800 ${isDefault ? 'bg-slate-900/40' : ''}`}>
+                          {/* 武器名称 */}
+                          <td className="px-2 py-2 min-w-[90px]">
+                            {isEditing && !isDefault ? (
+                              <input
+                                type="text"
+                                value={w.name}
+                                placeholder="武器名称"
+                                onChange={e => updateWeapon(wi, { name: e.target.value })}
+                                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs outline-none focus:border-cyan-500 text-slate-100 placeholder-slate-600"
+                              />
+                            ) : (
+                              <span className="font-bold text-slate-200 flex items-center gap-1">
+                                {w.name}
+                                {isDefault && <span className="text-[9px] text-slate-500 font-normal">默认</span>}
+                              </span>
+                            )}
+                          </td>
+
+                          {/* 使用技能 */}
+                          <td className="px-2 py-2 min-w-[120px]">
+                            {isEditing && !isDefault ? (
+                              <SkillAutocomplete
+                                value={w.skill}
+                                options={skillKeys}
+                                onChange={v => updateWeapon(wi, { skill: v })}
+                              />
+                            ) : (
+                              <span className="text-slate-300">{w.skill}</span>
+                            )}
+                          </td>
+
+                          {/* 类型 */}
+                          <td className="px-2 py-2">
+                            {isEditing && !isDefault ? (
+                              <select
+                                value={w.type}
+                                onChange={e => updateWeapon(wi, { type: e.target.value as Weapon['type'] })}
+                                className="bg-slate-900 border border-slate-700 rounded-lg px-1.5 py-1.5 text-xs outline-none focus:border-cyan-500 text-slate-100"
+                              >
+                                <option value="melee">近战</option>
+                                <option value="ranged">远程</option>
+                              </select>
+                            ) : (
+                              <span className={w.type === 'melee' ? 'text-amber-400' : 'text-sky-400'}>
+                                {w.type === 'melee' ? '近战' : '远程'}
+                              </span>
+                            )}
+                          </td>
+
+                          {/* 伤害 */}
+                          <td className="px-2 py-2">
+                            {isEditing && !isDefault ? (
+                              <div className="flex flex-wrap items-center gap-1">
+                                {w.damage.map((d, di) => (
+                                  <span key={di} className="flex items-center gap-1">
+                                    {di > 0 && <span className="text-slate-500">+</span>}
+                                    <input
+                                      type="number"
+                                      min={1}
+                                      value={d.count}
+                                      onChange={e => updateWeaponDice(wi, di, { count: Math.max(1, parseInt(e.target.value) || 1) })}
+                                      className="w-11 bg-slate-900 border border-slate-700 rounded-lg px-1 py-1 text-xs text-center outline-none focus:border-cyan-500 text-slate-100"
+                                    />
+                                    <span className="text-slate-500">D</span>
+                                    <select
+                                      value={d.sides}
+                                      onChange={e => updateWeaponDice(wi, di, { sides: parseInt(e.target.value) })}
+                                      className="bg-slate-900 border border-slate-700 rounded-lg px-1 py-1 text-xs outline-none focus:border-cyan-500 text-slate-100"
+                                    >
+                                      {DICE_SIDES_OPTIONS.map(s => <option key={s} value={s}>{s}</option>)}
+                                    </select>
+                                    {w.damage.length > 1 && (
+                                      <button
+                                        onClick={() => removeWeaponDice(wi, di)}
+                                        className="text-slate-600 hover:text-red-400"
+                                        title="删除该段骰子"
+                                      >
+                                        ✕
+                                      </button>
+                                    )}
+                                  </span>
+                                ))}
+                                {w.damage.length < 3 && (
+                                  <button
+                                    onClick={() => addWeaponDice(wi)}
+                                    className="text-cyan-500 hover:text-cyan-300 text-[10px] border border-slate-700 rounded px-1"
+                                    title="追加一段骰子（最多 3 段）"
+                                  >
+                                    +骰
+                                  </button>
+                                )}
+                                {w.type === 'melee' && <span className="text-slate-500">+ <span className="text-cyan-400">DB</span></span>}
+                              </div>
+                            ) : (
+                              <span className="font-mono text-cyan-400">{formatWeaponDamage(w)}</span>
+                            )}
+                          </td>
+
+                          {/* 次数 */}
+                          <td className="px-2 py-2">
+                            {isEditing && !isDefault ? (
+                              <input
+                                type="number"
+                                min={1}
+                                value={w.attacks}
+                                onChange={e => updateWeapon(wi, { attacks: Math.max(1, parseInt(e.target.value) || 1) })}
+                                className="w-14 bg-slate-900 border border-slate-700 rounded-lg px-1 py-1.5 text-xs text-center outline-none focus:border-cyan-500 text-slate-100"
+                              />
+                            ) : (
+                              <span className="text-slate-300">{w.attacks}</span>
+                            )}
+                          </td>
+
+                          {/* 对多 */}
+                          <td className="px-2 py-2">
+                            {isEditing && !isDefault ? (
+                              <select
+                                value={w.multi ? '1' : '0'}
+                                onChange={e => updateWeapon(wi, { multi: e.target.value === '1' })}
+                                className="bg-slate-900 border border-slate-700 rounded-lg px-1.5 py-1.5 text-xs outline-none focus:border-cyan-500 text-slate-100"
+                              >
+                                <option value="0">否</option>
+                                <option value="1">是</option>
+                              </select>
+                            ) : (
+                              <span className="text-slate-300">{w.multi ? '是' : '否'}</span>
+                            )}
+                          </td>
+
+                          {/* 故障值 */}
+                          <td className="px-2 py-2">
+                            {isEditing && !isDefault ? (
+                              <input
+                                type="number"
+                                min={1}
+                                max={100}
+                                value={w.malfunction ?? ''}
+                                placeholder="无"
+                                onChange={e => {
+                                  if (e.target.value === '') { updateWeapon(wi, { malfunction: null }); return; }
+                                  const n = parseInt(e.target.value) || 1;
+                                  updateWeapon(wi, { malfunction: Math.min(100, Math.max(1, n)) });
+                                }}
+                                className="w-14 bg-slate-900 border border-slate-700 rounded-lg px-1 py-1.5 text-xs text-center outline-none focus:border-cyan-500 text-slate-100 placeholder-slate-600"
+                              />
+                            ) : (
+                              <span className="text-slate-300">{w.malfunction ?? '无'}</span>
+                            )}
+                          </td>
+
+                          {/* 操作 */}
+                          {isEditing && (
+                            <td className="px-2 py-2">
+                              {isDefault ? (
+                                <span className="text-slate-600 text-[10px]" title="默认武器不可删除">🔒</span>
+                              ) : (
+                                <button
+                                  onClick={() => removeWeapon(wi)}
+                                  className="text-slate-500 hover:text-red-400"
+                                  title="删除武器"
+                                >
+                                  ✕
+                                </button>
+                              )}
+                            </td>
+                          )}
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+              {isEditing && (
+                <p className="text-[10px] text-slate-600 mt-1.5">
+                  近战武器的伤害会自动追加伤害加值（DB）；最多 6 把武器，第一把默认武器"肉搏"不可修改或删除。
+                </p>
+              )}
+            </>
+          );
+        })()}
+
+        {/* 法术列表（武器下方，法术名称必填；怪物不使用法术） */}
+        {character.type !== 'mob' && (() => {
+          const spells: Spell[] = isEditing ? editSpells : (character.spells || []);
+          const spellHeaders = ['法术名称', '使用代价', '作用', '备注'];
+          return (
+            <div className="mt-8">
+              <div className="flex items-center justify-between mb-3">
+                <h4 className="text-sm font-bold text-slate-400 uppercase tracking-wider">
+                  法术 {spells.length > 0 && (
+                    <span className="text-slate-600 normal-case font-normal">({spells.length})</span>
+                  )}
+                </h4>
+                {isEditing && (
+                  <button
+                    onClick={addSpell}
+                    className="bg-cyan-600 text-white px-3 py-1.5 rounded-lg text-xs font-bold hover:bg-cyan-500 transition-colors"
+                  >
+                    + 添加法术
+                  </button>
+                )}
+              </div>
+
+              {spells.length === 0 ? (
+                <div className="rounded-xl border border-dashed border-slate-700 px-3 py-4 text-center text-xs text-slate-600 italic">
+                  暂无法术
+                </div>
+              ) : (
+                <div className="overflow-x-auto rounded-xl border border-slate-700">
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr className="bg-slate-900/80 text-slate-500">
+                        {spellHeaders.map(h => (
+                          <th key={h} className="px-2 py-2 text-left font-bold whitespace-nowrap">{h}</th>
+                        ))}
+                        {isEditing && <th className="px-2 py-2 text-left font-bold">操作</th>}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {spells.map((s, si) => (
+                        <tr key={si} className="border-t border-slate-800">
+                          {/* 法术名称（必填） */}
+                          <td className="px-2 py-2 min-w-[110px]">
+                            {isEditing ? (
+                              <input
+                                type="text"
+                                value={s.name}
+                                placeholder="法术名称（必填）"
+                                onChange={e => updateSpell(si, { name: e.target.value })}
+                                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs outline-none focus:border-cyan-500 text-slate-100 placeholder-slate-600"
+                              />
+                            ) : (
+                              <span className="font-bold text-slate-200">{s.name}</span>
+                            )}
+                          </td>
+
+                          {/* 使用代价 */}
+                          <td className="px-2 py-2 min-w-[110px]">
+                            {isEditing ? (
+                              <input
+                                type="text"
+                                value={s.cost}
+                                placeholder="如：1D6 SAN"
+                                onChange={e => updateSpell(si, { cost: e.target.value })}
+                                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs outline-none focus:border-cyan-500 text-slate-100 placeholder-slate-600"
+                              />
+                            ) : (
+                              <span className="text-slate-300">{s.cost || '—'}</span>
+                            )}
+                          </td>
+
+                          {/* 作用 */}
+                          <td className="px-2 py-2 min-w-[180px]">
+                            {isEditing ? (
+                              <input
+                                type="text"
+                                value={s.effect}
+                                placeholder="作用描述"
+                                onChange={e => updateSpell(si, { effect: e.target.value })}
+                                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs outline-none focus:border-cyan-500 text-slate-100 placeholder-slate-600"
+                              />
+                            ) : (
+                              <span className="text-slate-300 whitespace-pre-wrap">{s.effect || '—'}</span>
+                            )}
+                          </td>
+
+                          {/* 备注 */}
+                          <td className="px-2 py-2 min-w-[120px]">
+                            {isEditing ? (
+                              <input
+                                type="text"
+                                value={s.note}
+                                placeholder="备注"
+                                onChange={e => updateSpell(si, { note: e.target.value })}
+                                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs outline-none focus:border-cyan-500 text-slate-100 placeholder-slate-600"
+                              />
+                            ) : (
+                              <span className="text-slate-300 whitespace-pre-wrap">{s.note || '—'}</span>
+                            )}
+                          </td>
+
+                          {/* 操作 */}
+                          {isEditing && (
+                            <td className="px-2 py-2">
+                              <button
+                                onClick={() => removeSpell(si)}
+                                className="text-slate-500 hover:text-red-400"
+                                title="删除法术"
+                              >
+                                ✕
+                              </button>
+                            </td>
+                          )}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          );
+        })()}
       </div>
 
       {/* 底部按钮 */}

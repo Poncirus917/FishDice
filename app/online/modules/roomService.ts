@@ -1,5 +1,8 @@
 import { supabase } from '../../lib/supabase';
-import type { Room, RoomWithMembers, RoomListItem, CreateRoomInput, DiceLog, DiceLogInsert } from './roomTypes';
+import type { Room, RoomWithMembers, RoomListItem, CreateRoomInput, DiceLog, DiceLogInsert, RoomNpcEntry } from './roomTypes';
+import type { CharacterState } from '../../(single)/page';
+import { DEFAULT_RULES, rulesToInsert, revealedFromMember } from './roomRules';
+import type { CardSection } from './roomRules';
 
 // 获取房间信息（包含成员列表）
 export const getRoom = async (roomId: string): Promise<RoomWithMembers | null> => {
@@ -79,12 +82,14 @@ export const createRoom = async (creatorId: string, input: CreateRoomInput): Pro
 
   const roomCode = generateRoomCode();
 
+  const rules = input.rules ?? DEFAULT_RULES;
   const { data, error } = await supabase
     .from('rooms')
     .insert({
       creator_id: creatorId,
       name: input.name,
       room_code: roomCode,
+      ...rulesToInsert(rules),
     })
     .select()
     .single();
@@ -284,7 +289,7 @@ export const detachFromRoom = async (roomId: string, userId: string): Promise<vo
   }
 };
 
-// 恢复房间（原离开者的角色）
+// 恢复房间（原离开者的成员）
 export const resumeRoom = async (roomId: string, userId: string): Promise<void> => {
   const { error } = await supabase
     .from('room_members')
@@ -293,6 +298,33 @@ export const resumeRoom = async (roomId: string, userId: string): Promise<void> 
     .eq('user_id', userId);
 
   if (error) throw error;
+};
+
+// KP 揭示某 PL 角色卡的一个分区给其他 PL（追加到 revealed_sections，不可逆）
+// 返回更新后的完整分区列表；RLS 拒绝 / 行不存在时明确报错
+export const revealCardSection = async (memberId: string, section: CardSection): Promise<CardSection[]> => {
+  // 先读当前值（RLS 允许房间成员读 room_members）
+  const { data: cur, error: readErr } = await supabase
+    .from('room_members')
+    .select('revealed_sections')
+    .eq('id', memberId)
+    .single();
+  if (readErr) throw new Error(readErr.message);
+
+  const next = revealedFromMember(cur?.revealed_sections);
+  if (next.includes(section)) return next;
+  next.push(section);
+
+  const { data: updated, error: updErr } = await supabase
+    .from('room_members')
+    .update({ revealed_sections: next })
+    .eq('id', memberId)
+    .select('revealed_sections')
+    .single();
+  if (updErr) throw new Error(updErr.message);
+  if (!updated) throw new Error('揭示失败，可能没有操作权限');
+
+  return revealedFromMember(updated.revealed_sections);
 };
 
 // KP 暂停房间：KP 与所有 PL 全部暂离（detached），房间进入 paused；
@@ -365,12 +397,12 @@ export const getUserCreatedRooms = async (userId: string): Promise<RoomListItem[
 export const getUserJoinedRooms = async (userId: string): Promise<RoomListItem[]> => {
   console.log('[getUserJoinedRooms] 开始, userId:', userId);
   // 只查询确定存在的列（线上旧表可能没有 role 字段，引用不存在的列会导致整个查询失败）
-  // 排除 removed：被 KP 移除的房间不在历史记录中显示；left（主动退出）仍保留
+  // 仅保留 active / detached：主动退出（left）的房间不入历史，被移除（removed）的房间同样不显示
   const { data, error } = await supabase
     .from('room_members')
     .select('room_id, status, joined_at')
     .eq('user_id', userId)
-    .in('status', ['active', 'detached', 'left']);
+    .in('status', ['active', 'detached']);
 
   console.log('[getUserJoinedRooms] 成员记录:', { count: data?.length, error, data });
   if (error) throw new Error(error.message);
@@ -403,7 +435,7 @@ export const getUserJoinedRooms = async (userId: string): Promise<RoomListItem[]
         member_count: 0,
         // 已过滤掉自己创建的房间，剩下的记录身份必然是 PL
         user_role: 'pl' as const,
-        member_status: memberInfo?.status as 'active' | 'detached' | 'left',
+        member_status: memberInfo?.status as 'active' | 'detached',
       };
     });
 
@@ -450,7 +482,7 @@ export const insertDiceLog = async (input: DiceLogInsert): Promise<DiceLog> => {
 };
 
 // 读取房间最近的掷骰 / 消息日志（按时间正序，便于像聊天记录一样从旧到新展示）
-// hidden 暗骰行由 RLS 自动处理：PL 的查询结果中不包含，KP 正常返回
+// hidden 暗骰 / 他人 note 笔记行由 RLS 自动过滤，客户端无需特殊处理
 export const getDiceLogs = async (roomId: string, limit: number = 200): Promise<DiceLog[]> => {
   const { data, error } = await supabase
     .from('dice_logs')
@@ -461,4 +493,88 @@ export const getDiceLogs = async (roomId: string, limit: number = 200): Promise<
 
   if (error) throw new Error(error.message);
   return (data || []) as DiceLog[];
+};
+
+// 删除单条掷骰 / 消息日志（RLS：作者本人或 KP 可删；UI 上仅 KP 提供入口）
+export const deleteDiceLog = async (logId: string): Promise<void> => {
+  const { data, error } = await supabase
+    .from('dice_logs')
+    .delete()
+    .eq('id', logId)
+    .select();
+
+  if (error) throw new Error(error.message);
+  if (!data || data.length === 0) {
+    throw new Error('删除失败，可能没有操作权限');
+  }
+};
+
+// ---------- 房间 NPC / 怪物实例 ----------
+
+// 查询房间的角色实例（KP 看到全部；PL 受 RLS 限制只返回 visible 实例）
+export const getRoomNpcEntries = async (roomId: string): Promise<RoomNpcEntry[]> => {
+  const { data, error } = await supabase
+    .from('room_npcs')
+    .select('*')
+    .eq('room_id', roomId)
+    .order('added_at', { ascending: true });
+
+  if (error) throw new Error(error.message);
+  return (data || []) as RoomNpcEntry[];
+};
+
+// 把一个角色加入房间（默认 visible=false 对 PL 隐藏）。
+// NPC 每个房间只能存在一个；怪物可重复加入多个实例。
+export const addRoomNpcEntry = async (roomId: string, character: CharacterState): Promise<RoomNpcEntry> => {
+  if (character.type === 'npc') {
+    const { data: existing, error: checkError } = await supabase
+      .from('room_npcs')
+      .select('id')
+      .eq('room_id', roomId)
+      .eq('character_id', character.id);
+
+    if (checkError) throw new Error(checkError.message);
+    if (existing && existing.length > 0) {
+      throw new Error(`NPC「${character.name}」已在房间中，不能重复加入`);
+    }
+  }
+
+  const { data, error } = await supabase
+    .from('room_npcs')
+    .insert({ room_id: roomId, character_id: character.id, visible: false })
+    .select()
+    .single();
+
+  if (error) throw new Error(error.message);
+  if (!data) throw new Error('加入房间失败');
+  return data as RoomNpcEntry;
+};
+
+// 切换实例的 PL 可见性
+export const setRoomNpcVisible = async (entryId: string, visible: boolean): Promise<void> => {
+  const { data, error } = await supabase
+    .from('room_npcs')
+    .update({ visible })
+    .eq('id', entryId)
+    .select();
+
+  if (error) throw new Error(error.message);
+  if (!data || data.length === 0) {
+    throw new Error('可见性更新失败，可能没有操作权限');
+  }
+};
+
+// 移除实例（只删关联，角色仍在 KP 角色库）。
+// RLS 保证只有 visible=false 才能删，可见角色需先改回不可见。
+export const removeRoomNpcEntry = async (entryId: string): Promise<void> => {
+  const { data, error } = await supabase
+    .from('room_npcs')
+    .delete()
+    .eq('id', entryId)
+    .select();
+
+  if (error) throw new Error(error.message);
+  if (!data || data.length === 0) {
+    throw new Error('移除失败：该角色当前在场，请先改为不在场');
+  }
 };

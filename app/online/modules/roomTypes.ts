@@ -1,4 +1,5 @@
 import type { DiceGroup } from '../../utils/dice';
+import type { CardSectionsState } from './roomRules';
 
 export type RoomStatus = 'active' | 'paused' | 'deleted';
 export type MemberStatus = 'active' | 'detached' | 'left' | 'removed';
@@ -10,6 +11,12 @@ export interface Room {
   name: string;
   creator_id: string;
   status: RoomStatus;
+  // 房规（创建时确定；老房间由 rulesFromRoom 回退默认）
+  card_sections: CardSectionsState;
+  enable_push: boolean;
+  enable_burn_luck: boolean;
+  crit_threshold: number;
+  fumble_threshold: number;
   created_at: string;
   updated_at: string;
 }
@@ -21,6 +28,8 @@ export interface RoomMember {
   character_id: string | null;
   role: MemberRole;
   status: MemberStatus;
+  // KP 在房间内揭示给其他 PL 的角色卡分区（不可逆）
+  revealed_sections: string[];
   joined_at: string;
   left_at: string | null;
 }
@@ -43,6 +52,7 @@ export interface RoomListItem {
 
 export interface CreateRoomInput {
   name: string;
+  rules?: import('./roomRules').RoomRules;
   system?: string;
   playerLimit?: number;
   roundLimit?: number;
@@ -111,4 +121,13 @@ export interface PerformCustomInput {
   bonus?: number;
   characterId?: string | null;
   charName?: string | null;
+}
+
+// room_npcs 一行：房间内的一个 NPC/怪物实例
+export interface RoomNpcEntry {
+  id: string;
+  room_id: string;
+  character_id: string;
+  visible: boolean;
+  added_at: string;
 }

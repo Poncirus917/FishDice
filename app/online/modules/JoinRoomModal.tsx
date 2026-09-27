@@ -6,6 +6,8 @@ import { useRoom } from './RoomContext';
 import { useConfirmDialog } from './ConfirmDialog';
 import { supabase } from '../../lib/supabase';
 import type { CharacterState } from '../../(single)/page';
+import { rulesFromRoom, CARD_SECTION_OPTIONS } from './roomRules';
+import type { RoomRules } from './roomRules';
 
 interface JoinRoomModalProps {
   isOpen: boolean;
@@ -23,6 +25,21 @@ interface RoomInfo {
   creator_avatar: string | null;
 }
 
+// 房规可见性小标签：visible=青色可见 / 否则灰色不可见
+function RulesChip({ label, visible }: { label: string; visible: boolean }) {
+  return (
+    <span
+      className={`text-[10px] px-2 py-0.5 rounded-full border font-bold ${
+        visible
+          ? 'bg-cyan-900/40 border-cyan-700 text-cyan-300'
+          : 'bg-slate-800/60 border-slate-700 text-slate-500'
+      }`}
+    >
+      {visible ? '✓' : '✕'} {label}
+    </span>
+  );
+}
+
 export function JoinRoomModal({ isOpen, roomCode, onClose, onRoomEnter }: JoinRoomModalProps) {
   const { joinRoom } = useRoom();
   const { showConfirm, Dialog } = useConfirmDialog();
@@ -34,6 +51,8 @@ export function JoinRoomModal({ isOpen, roomCode, onClose, onRoomEnter }: JoinRo
   const [submitting, setSubmitting] = useState(false);
   const [currentUserId, setCurrentUserId] = useState<string | null>(null);
   const [isCreator, setIsCreator] = useState(false);
+  // 房规（创建时确定，加入前供玩家确认：角色卡可见性 / 孤注一掷 / 燃烧幸运 / 阈值）
+  const [rules, setRules] = useState<RoomRules | null>(null);
   
   // 成员状态：null=新成员, 'detached'=暂离, 'left'=退出过
   const [memberStatus, setMemberStatus] = useState<'detached' | 'left' | null>(null);
@@ -48,6 +67,7 @@ export function JoinRoomModal({ isOpen, roomCode, onClose, onRoomEnter }: JoinRo
       setMemberStatus(null);
       setPreviousCharacterId(null);
       setSelectedCharacterId(null);
+      setRules(null);
 
       try {
         const userId = (await supabase.auth.getSession()).data.session?.user.id;
@@ -55,7 +75,7 @@ export function JoinRoomModal({ isOpen, roomCode, onClose, onRoomEnter }: JoinRo
 
         const { data: room, error: roomError } = await supabase
           .from('rooms')
-          .select('id, name, room_code, creator_id, status')
+          .select('id, name, room_code, creator_id, status, card_sections, enable_push, enable_burn_luck, crit_threshold, fumble_threshold')
           .eq('room_code', roomCode)
           .single();
 
@@ -64,6 +84,8 @@ export function JoinRoomModal({ isOpen, roomCode, onClose, onRoomEnter }: JoinRo
           setLoading(false);
           return;
         }
+
+        setRules(rulesFromRoom(room));
 
         const isRoomCreator = userId === room.creator_id;
         setIsCreator(isRoomCreator);
@@ -267,18 +289,54 @@ export function JoinRoomModal({ isOpen, roomCode, onClose, onRoomEnter }: JoinRo
               )}
             </div>
 
-            {/* 成员状态提示 */}
+            {/* 房规一览：加入前确认角色卡可见性、可选规则与阈值 */}
+            {rules && (
+              <div className="bg-slate-900/50 rounded-xl p-4 mb-6 border border-slate-700">
+                <h3 className="text-sm font-bold text-slate-200 mb-3 flex items-center gap-2">📜 房规一览</h3>
+
+                {/* PC 角色卡初始可见性 */}
+                <div className="text-xs text-slate-500 mb-1.5">PC 角色卡可见性（初始）</div>
+                <div className="flex flex-wrap gap-1.5 mb-4">
+                  <RulesChip label="头像与姓名" visible />
+                  {CARD_SECTION_OPTIONS.map(o => (
+                    <RulesChip key={o.key} label={o.label} visible={rules.card_sections[o.key]} />
+                  ))}
+                </div>
+
+                {/* 可选规则 */}
+                <div className="grid grid-cols-2 gap-2 mb-3">
+                  <div className="flex items-center justify-between bg-slate-900/60 border border-slate-700 rounded-lg px-2.5 py-1.5">
+                    <span className="text-xs text-slate-400">孤注一掷</span>
+                    <span className={`text-xs font-bold ${rules.enable_push ? 'text-emerald-400' : 'text-slate-600'}`}>
+                      {rules.enable_push ? '启用' : '未启用'}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between bg-slate-900/60 border border-slate-700 rounded-lg px-2.5 py-1.5">
+                    <span className="text-xs text-slate-400">燃烧幸运</span>
+                    <span className={`text-xs font-bold ${rules.enable_burn_luck ? 'text-emerald-400' : 'text-slate-600'}`}>
+                      {rules.enable_burn_luck ? '启用' : '未启用'}
+                    </span>
+                  </div>
+                </div>
+
+                {/* 阈值 */}
+                <div className="flex items-center justify-center gap-4 text-xs">
+                  <span className="text-slate-400">
+                    大成功 <b className="text-emerald-400 text-sm">≤ {rules.crit_threshold}</b>
+                  </span>
+                  <span className="text-slate-700">|</span>
+                  <span className="text-slate-400">
+                    大失败 <b className="text-red-400 text-sm">≥ {rules.fumble_threshold}</b>
+                  </span>
+                </div>
+              </div>
+            )}
+
+            {/* 成员状态提示（主动退出不显示任何提示，按新加入流程走） */}
             {memberStatus === 'detached' && !isCreator && (
               <div className="mb-4 p-3 bg-amber-900/30 rounded-lg border border-amber-700">
                 <p className="text-amber-300 text-sm">
                   ⏸️ 你之前暂离了此房间，将使用原有角色加入
-                </p>
-              </div>
-            )}
-            {memberStatus === 'left' && !isCreator && (
-              <div className="mb-4 p-3 bg-cyan-900/30 rounded-lg border border-cyan-700">
-                <p className="text-cyan-300 text-sm">
-                  🔄 你之前退出了此房间，需要重新确认角色
                 </p>
               </div>
             )}
