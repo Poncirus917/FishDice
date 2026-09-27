@@ -449,6 +449,11 @@ export default function AuthPage() {
             </button>
           )}
         </div>
+
+        {/* 多账号使用提示 */}
+        <p className="mt-5 pt-4 border-t border-slate-700/60 text-center text-[11px] text-slate-500 leading-relaxed">
+          💡 同一浏览器同一时间仅支持一个账号；需同时登录多个账号，请使用不同浏览器或浏览器的隐身窗口。
+        </p>
       </div>
     </div>
   );

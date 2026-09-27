@@ -73,6 +73,9 @@ function OnlinePageContent() {
         localStorage.setItem('fish_display_name', name);
       }
       setChecking(false);
+    }).catch(() => {
+      // 鉴权检查异常也跳转登录页，避免永久卡 LOADING
+      router.push('/online/auth');
     });
   }, [router]);
 
@@ -575,17 +578,64 @@ function OnlinePageContent() {
 
 // ===================== 主页面组件 =====================
 export default function OnlinePage() {
+  const router = useRouter();
   const [userId, setUserId] = useState<string | null>(null);
+  const [authReady, setAuthReady] = useState(false);
+  // 记录本标签首次恢复的账号，用于检测“同浏览器登录另一个账号”的情况
+  const initialUidRef = useRef<string | null>(null);
+  const accountConflictNotifiedRef = useRef(false);
 
   useEffect(() => {
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      if (session) {
-        setUserId(session.user.id);
+    let mounted = true;
+
+    const redirectToAuth = () => {
+      if (mounted) setAuthReady(true); // 防止跳转失败时永久卡 LOADING
+      router.replace('/online/auth');
+    };
+
+    // 鉴权状态变化：退出 → 回登录页；账号被其它标签切换 → 明确提示而非静默混乱
+    const { data: authListener } = supabase.auth.onAuthStateChange((event, session) => {
+      if (event === 'SIGNED_OUT') {
+        redirectToAuth();
+        return;
+      }
+      if (
+        (event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED') &&
+        session &&
+        initialUidRef.current &&
+        session.user.id !== initialUidRef.current &&
+        !accountConflictNotifiedRef.current
+      ) {
+        accountConflictNotifiedRef.current = true;
+        toast.error('检测到同一浏览器登录了另一个账号。多账号同时使用请开隐身窗口或使用不同浏览器，否则数据会互相干扰。');
       }
     });
-  }, []);
 
-  if (!userId) {
+    supabase.auth
+      .getSession()
+      .then(({ data: { session } }) => {
+        if (!mounted) return;
+        if (!session) {
+          // 未登录：必须在外层直接跳转（内层组件仅在登录后才渲染，否则会永久卡 LOADING）
+          redirectToAuth();
+          return;
+        }
+        initialUidRef.current = session.user.id;
+        setUserId(session.user.id);
+        setAuthReady(true);
+      })
+      .catch(() => {
+        if (mounted) redirectToAuth();
+      });
+
+    return () => {
+      mounted = false;
+      authListener.subscription.unsubscribe();
+    };
+  }, [router]);
+
+  // 鉴权检查完成前显示 LOADING（检查必定会结束：成功进入 或 跳转登录页）
+  if (!authReady || !userId) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-slate-900">
         <div className="text-cyan-400 animate-pulse text-sm tracking-widest">LOADING...</div>
