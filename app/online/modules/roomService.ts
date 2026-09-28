@@ -1,5 +1,5 @@
 import { supabase } from '../../lib/supabase';
-import type { Room, RoomWithMembers, RoomListItem, CreateRoomInput, DiceLog, DiceLogInsert, RoomNpcEntry } from './roomTypes';
+import type { Room, RoomWithMembers, RoomListItem, CreateRoomInput, DiceLog, DiceLogInsert, RoomNpcEntry, PrivateGroupWithMembers, CreatePrivateGroupInput } from './roomTypes';
 import type { CharacterState } from '../../(single)/page';
 import { DEFAULT_RULES, rulesToInsert, revealedFromMember } from './roomRules';
 import type { CardSection } from './roomRules';
@@ -577,4 +577,134 @@ export const removeRoomNpcEntry = async (entryId: string): Promise<void> => {
   if (!data || data.length === 0) {
     throw new Error('移除失败：该角色当前在场，请先改为不在场');
   }
+};
+
+// ============================================
+// 密聊小群（private_groups）
+// ============================================
+
+// 拉取房间内当前用户可见的密聊群（PL 仅自己所属群；KP 全部），含成员
+export const getPrivateGroups = async (roomId: string): Promise<PrivateGroupWithMembers[]> => {
+  const { data: groups, error } = await supabase
+    .from('private_groups')
+    .select('*')
+    .eq('room_id', roomId)
+    .order('created_at', { ascending: true });
+
+  if (error) throw new Error(error.message);
+  if (!groups || groups.length === 0) return [];
+
+  const groupIds = groups.map(g => g.id);
+  const { data: members, error: membersError } = await supabase
+    .from('private_group_members')
+    .select('*')
+    .in('group_id', groupIds);
+
+  if (membersError) throw new Error(membersError.message);
+
+  return groups.map(g => ({
+    ...g,
+    members: (members || []).filter(m => m.group_id === g.id),
+  })) as PrivateGroupWithMembers[];
+};
+
+// KP 创建密聊群：插入群 + 选定成员（不包含 KP 本人；KP 靠房间创建者权限读写）
+export const createPrivateGroup = async (input: CreatePrivateGroupInput): Promise<PrivateGroupWithMembers> => {
+  const memberIds = [...new Set(input.memberUserIds)].filter(Boolean);
+  if (memberIds.length === 0) throw new Error('请至少选择一名玩家');
+
+  // 群名：KP 自定义，否则按序号自动命名
+  let name = (input.name || '').trim();
+  if (!name) {
+    const { count } = await supabase
+      .from('private_groups')
+      .select('id', { count: 'exact', head: true })
+      .eq('room_id', input.roomId);
+    name = `密聊 #${(count ?? 0) + 1}`;
+  }
+
+  // 前端预生成 id，以 return=minimal 写入：
+  // PostgREST 对该表 INSERT...RETURNING 的结果行可见性检查与 RLS 存在兼容问题
+  // （独立 SELECT 正常、带 RETURNING 即报 42501），不回传结果行即可稳定创建
+  const groupId = crypto.randomUUID();
+  const createdAt = new Date().toISOString();
+
+  const { error } = await supabase
+    .from('private_groups')
+    .insert({ id: groupId, room_id: input.roomId, name, created_by: input.createdBy });
+
+  if (error) throw new Error(error.message);
+
+  const rows = memberIds.map(uid => ({ group_id: groupId, user_id: uid, can_speak: true }));
+  const { error: membersError } = await supabase
+    .from('private_group_members')
+    .insert(rows);
+
+  if (membersError) throw new Error(membersError.message);
+
+  return {
+    id: groupId,
+    room_id: input.roomId,
+    name,
+    created_by: input.createdBy,
+    created_at: createdAt,
+    members: rows.map(r => ({ ...r, joined_at: createdAt })),
+  };
+};
+
+// KP 解散密聊群（消息行存于 dice_logs，群删除后 whisper 历史仍保留在各成员日志中）
+export const deletePrivateGroup = async (groupId: string): Promise<void> => {
+  const { error } = await supabase
+    .from('private_groups')
+    .delete()
+    .eq('id', groupId);
+
+  if (error) throw new Error(error.message);
+};
+
+// KP 切换整群是否允许 PL 发言（作用于群内所有成员行；KP 本人不受 can_speak 限制）
+export const setGroupCanSpeak = async (groupId: string, canSpeak: boolean): Promise<void> => {
+  // 同样以 return=minimal 更新，避免该表 RETURNING 可见性检查的 42501 问题
+  const { error } = await supabase
+    .from('private_group_members')
+    .update({ can_speak: canSpeak })
+    .eq('group_id', groupId);
+
+  if (error) throw new Error(error.message);
+
+  // 单独查询校验更新是否真的生效（RLS 静默拒绝时行数不会变化）
+  const { count } = await supabase
+    .from('private_group_members')
+    .select('user_id', { count: 'exact', head: true })
+    .eq('group_id', groupId)
+    .eq('can_speak', !canSpeak);
+
+  if ((count ?? 0) !== 0) {
+    throw new Error('设置失败，可能没有操作权限');
+  }
+};
+
+// 发送一条密聊消息（msg_type='whisper'；RLS 保证仅群成员与 KP 可读 / PL 需 can_speak）
+export const sendPrivateMessage = async (params: {
+  roomId: string;
+  groupId: string;
+  groupName: string;
+  senderUserId: string;
+  senderName: string;
+  text: string;
+  characterId?: string | null;
+}): Promise<DiceLog> => {
+  const text = params.text.trim();
+  if (!text) throw new Error('请输入消息内容');
+
+  return insertDiceLog({
+    room_id: params.roomId,
+    user_id: params.senderUserId,
+    character_id: params.characterId ?? null,
+    char_name: params.senderName,
+    msg_type: 'whisper',
+    label: params.groupName,
+    level: text,
+    payload: { group_id: params.groupId, group_name: params.groupName },
+  });
 };

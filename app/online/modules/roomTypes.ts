@@ -75,7 +75,7 @@ export interface JoinRoomInput {
 // request KP 请求掷骰
 // note    剧情笔记/文字记录
 // status  状态变更
-export type DiceMsgType = 'check' | 'custom' | 'damage' | 'hidden' | 'request' | 'note' | 'status';
+export type DiceMsgType = 'check' | 'custom' | 'damage' | 'hidden' | 'request' | 'note' | 'status' | 'speech' | 'whisper';
 
 export interface DiceLog {
   id: string;
@@ -130,4 +130,34 @@ export interface RoomNpcEntry {
   character_id: string;
   visible: boolean;
   added_at: string;
+}
+
+// private_groups 一行：KP 发起的一个密聊小群
+export interface PrivateGroup {
+  id: string;
+  room_id: string;
+  name: string;
+  created_by: string;
+  created_at: string;
+}
+
+// private_group_members 一行：密聊群中的一个成员及其发言权限
+export interface PrivateGroupMember {
+  group_id: string;
+  user_id: string;
+  can_speak: boolean;
+  joined_at: string;
+}
+
+// 密聊群（带成员列表）——前端使用的聚合结构
+export interface PrivateGroupWithMembers extends PrivateGroup {
+  members: PrivateGroupMember[];
+}
+
+// 创建密聊群入参
+export interface CreatePrivateGroupInput {
+  roomId: string;
+  createdBy: string;
+  name?: string;
+  memberUserIds: string[];
 }

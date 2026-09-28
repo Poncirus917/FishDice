@@ -24,6 +24,15 @@ server/node_modules/
 # misc
 .DS_Store
 *.pem
+# 密钥 / 证书类文件兜底
+*.key
+*.cert
+*.p12
+*.pfx
+*.keystore
+
+# Cloudflare Wrangler 本地状态（可能含账号信息）
+.wrangler/
 
 # debug
 npm-debug.log*
@@ -45,6 +54,7 @@ next-env.d.ts
 跑团助手：COC跑团的协助.md
 前端样式参考手册.md
 fishdice1.md
+联机掷骰系统设计.md
 
 # server 构建产物
 server/dist/

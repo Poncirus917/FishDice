@@ -257,15 +257,17 @@ CREATE POLICY "Users can update their own membership" ON room_members
 --   damage  数值变化日志（阶段3）
 --   hidden  暗骰：仅 KP（房间创建者）可读取内容，PL 端只见"KP 进行了暗骰"提示（阶段3）
 --   request KP 请求掷骰的系统消息（阶段4）
---   note    剧情笔记 / 文字记录
---   status  状态变更（重伤、疯狂等）
+--   note    剧情笔记 / 文字记录（私有，仅作者本人可读）
+--   status  状态变更（重伤、疯狂、揭示角色卡分区等）
+--   speech  房间发言，全房可见
+--   whisper KP 发起的密聊小群消息，仅群成员与 KP 可读（群 id 存 payload.group_id）
 CREATE TABLE IF NOT EXISTS dice_logs (
   id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
   room_id UUID REFERENCES rooms(id) ON DELETE CASCADE NOT NULL,
   user_id UUID REFERENCES auth.users(id) NOT NULL,
   character_id TEXT,
   char_name TEXT,
-  msg_type TEXT NOT NULL CHECK (msg_type IN ('check', 'custom', 'damage', 'hidden', 'request', 'note', 'status')),
+  msg_type TEXT NOT NULL CHECK (msg_type IN ('check', 'custom', 'damage', 'hidden', 'request', 'note', 'status', 'speech', 'whisper')),
   label TEXT NOT NULL DEFAULT '',
   roll INTEGER,
   target INTEGER,
@@ -279,12 +281,134 @@ CREATE INDEX IF NOT EXISTS idx_dice_logs_room ON dice_logs(room_id, created_at);
 -- Realtime 要求：UPDATE/DELETE 事件需完整旧行（INSERT 不依赖，先为后续阶段备好）
 ALTER TABLE dice_logs REPLICA IDENTITY FULL;
 
+-- ============================================
+-- 12b. private_groups 密聊小群表（KP 发起，选定一个或多个 PL；消息走 dice_logs whisper）
+-- ============================================
+CREATE TABLE IF NOT EXISTS private_groups (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  room_id UUID REFERENCES rooms(id) ON DELETE CASCADE NOT NULL,
+  name TEXT NOT NULL,
+  created_by UUID REFERENCES auth.users(id) NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_private_groups_room ON private_groups(room_id);
+
+CREATE TABLE IF NOT EXISTS private_group_members (
+  group_id UUID REFERENCES private_groups(id) ON DELETE CASCADE NOT NULL,
+  user_id UUID REFERENCES auth.users(id) NOT NULL,
+  -- KP 可控制该群是否允许 PL 发言（KP 本人不受限制）
+  can_speak BOOLEAN NOT NULL DEFAULT true,
+  joined_at TIMESTAMPTZ DEFAULT NOW(),
+  PRIMARY KEY (group_id, user_id)
+);
+
+-- SECURITY DEFINER 辅助函数（绕过 RLS，避免策略自引用递归）：
+-- 用户是否为某密聊群成员
+CREATE OR REPLACE FUNCTION public.is_private_group_member(p_group_id UUID, p_user_id UUID)
+RETURNS BOOLEAN
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
+AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM public.private_group_members
+    WHERE group_id = p_group_id AND user_id = p_user_id
+  );
+$$;
+
+-- 用户是否为某密聊群中被允许发言的成员（can_speak=true）
+CREATE OR REPLACE FUNCTION public.is_private_group_speaker(p_group_id UUID, p_user_id UUID)
+RETURNS BOOLEAN
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
+AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM public.private_group_members
+    WHERE group_id = p_group_id AND user_id = p_user_id AND can_speak = true
+  );
+$$;
+
+-- 用户是否为某密聊群所属房间的创建者（KP）
+CREATE OR REPLACE FUNCTION public.is_private_group_room_creator(p_group_id UUID, p_user_id UUID)
+RETURNS BOOLEAN
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
+AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM public.private_groups g
+    JOIN public.rooms r ON r.id = g.room_id
+    WHERE g.id = p_group_id AND r.creator_id = p_user_id
+  );
+$$;
+
+-- RLS: private_groups（仅 KP 可增改删；KP 或本群成员可读）
+ALTER TABLE private_groups ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "KP or members can view private groups" ON private_groups;
+CREATE POLICY "KP or members can view private groups" ON private_groups
+  FOR SELECT TO authenticated
+  USING (
+    public.is_private_group_room_creator(id, auth.uid())
+    OR public.is_private_group_member(id, auth.uid())
+  );
+
+DROP POLICY IF EXISTS "KP can create private groups" ON private_groups;
+CREATE POLICY "KP can create private groups" ON private_groups
+  FOR INSERT TO authenticated
+  WITH CHECK (public.is_room_creator(room_id, auth.uid()) AND created_by = auth.uid());
+
+DROP POLICY IF EXISTS "KP can update private groups" ON private_groups;
+CREATE POLICY "KP can update private groups" ON private_groups
+  FOR UPDATE TO authenticated
+  USING (public.is_private_group_room_creator(id, auth.uid()));
+
+DROP POLICY IF EXISTS "KP can delete private groups" ON private_groups;
+CREATE POLICY "KP can delete private groups" ON private_groups
+  FOR DELETE TO authenticated
+  USING (public.is_private_group_room_creator(id, auth.uid()));
+
+-- RLS: private_group_members（仅 KP 可增改删；KP 可看全部，本人只能看自己的行）
+ALTER TABLE private_group_members ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "KP or self can view memberships" ON private_group_members;
+CREATE POLICY "KP or self can view memberships" ON private_group_members
+  FOR SELECT TO authenticated
+  USING (
+    public.is_private_group_room_creator(group_id, auth.uid())
+    OR user_id = auth.uid()
+  );
+
+DROP POLICY IF EXISTS "KP can insert memberships" ON private_group_members;
+CREATE POLICY "KP can insert memberships" ON private_group_members
+  FOR INSERT TO authenticated
+  WITH CHECK (public.is_private_group_room_creator(group_id, auth.uid()));
+
+DROP POLICY IF EXISTS "KP can update memberships" ON private_group_members;
+CREATE POLICY "KP can update memberships" ON private_group_members
+  FOR UPDATE TO authenticated
+  USING (public.is_private_group_room_creator(group_id, auth.uid()));
+
+DROP POLICY IF EXISTS "KP can delete memberships" ON private_group_members;
+CREATE POLICY "KP can delete memberships" ON private_group_members
+  FOR DELETE TO authenticated
+  USING (public.is_private_group_room_creator(group_id, auth.uid()));
+
+-- 密聊群 / 成员加入 Realtime 发布（幂等）；PL 仅收到自己所属群的事件（RLS 控制）
+DO $$
+BEGIN
+  ALTER PUBLICATION supabase_realtime ADD TABLE public.private_groups;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+DO $$
+BEGIN
+  ALTER PUBLICATION supabase_realtime ADD TABLE public.private_group_members;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
 -- RLS: dice_logs
 ALTER TABLE dice_logs ENABLE ROW LEVEL SECURITY;
 
 -- 读取：房间成员可读；hidden 暗骰行只有 KP（创建者）能读；
--- note 笔记行仅作者本人可读（私有笔记，他人不可见）
--- Postgres Changes 同样遵守 RLS，因此暗骰 / 他人笔记的 INSERT 不会推送到其它客户端
+-- note 笔记行仅作者本人可读（私有笔记，他人不可见）；
+-- whisper 密聊行仅群成员与 KP 可读（群 id 取 payload.group_id）
+-- Postgres Changes 同样遵守 RLS，因此暗骰 / 他人笔记 / 外群密聊的 INSERT 不会推送到无权客户端
 DROP POLICY IF EXISTS "Room members can read dice logs" ON dice_logs;
 CREATE POLICY "Room members can read dice logs" ON dice_logs
   FOR SELECT TO authenticated
@@ -292,15 +416,26 @@ CREATE POLICY "Room members can read dice logs" ON dice_logs
     (public.is_room_creator(room_id, auth.uid()) OR public.is_room_member(room_id, auth.uid()))
     AND (msg_type <> 'hidden' OR public.is_room_creator(room_id, auth.uid()))
     AND (msg_type <> 'note' OR user_id = auth.uid())
+    AND (
+      msg_type <> 'whisper'
+      OR public.is_room_creator(room_id, auth.uid())
+      OR public.is_private_group_member(CAST(payload->>'group_id' AS UUID), auth.uid())
+    )
   );
 
--- 写入：房间成员可写；hidden 暗骰只允许 KP 写入
+-- 写入：房间成员可写；hidden 暗骰只允许 KP 写入；
+-- whisper 密聊：KP 始终可写，PL 必须是该群 can_speak=true 的成员
 DROP POLICY IF EXISTS "Room members can insert dice logs" ON dice_logs;
 CREATE POLICY "Room members can insert dice logs" ON dice_logs
   FOR INSERT TO authenticated
   WITH CHECK (
     (public.is_room_creator(room_id, auth.uid()) OR public.is_room_member(room_id, auth.uid()))
     AND (msg_type <> 'hidden' OR public.is_room_creator(room_id, auth.uid()))
+    AND (
+      msg_type <> 'whisper'
+      OR public.is_room_creator(room_id, auth.uid())
+      OR public.is_private_group_speaker(CAST(payload->>'group_id' AS UUID), auth.uid())
+    )
   );
 
 -- 更新：作者本人或 KP
@@ -309,11 +444,14 @@ CREATE POLICY "Author or KP can update dice logs" ON dice_logs
   FOR UPDATE TO authenticated
   USING (user_id = auth.uid() OR public.is_room_creator(room_id, auth.uid()));
 
--- 删除：作者本人或 KP（为后续"删除单条日志"预留）
+-- 删除：作者本人或 KP（为后续"删除单条日志"预留）；房间发言任何人不可删除
 DROP POLICY IF EXISTS "Author or KP can delete dice logs" ON dice_logs;
 CREATE POLICY "Author or KP can delete dice logs" ON dice_logs
   FOR DELETE TO authenticated
-  USING (user_id = auth.uid() OR public.is_room_creator(room_id, auth.uid()));
+  USING (
+    msg_type <> 'speech'
+    AND (user_id = auth.uid() OR public.is_room_creator(room_id, auth.uid()))
+  );
 
 -- 加入 Realtime 发布（幂等：重复执行不报错）
 DO $$
@@ -482,4 +620,161 @@ CREATE POLICY "Users can update their own membership" ON public.room_members
   );
 
 -- 刷新 PostgREST schema 缓存（新列 / RLS 变更后避免“找不到列 / 表”错误）
+NOTIFY pgrst, 'reload schema';
+
+-- ============================================
+-- 15. 新增房间发言 / 密聊消息类型 msg_type='speech' / 'whisper'（已建库的环境执行本节；幂等）
+-- ============================================
+-- speech 行对全房间成员可读，但任何人不可删除，故需重建 DELETE 策略。
+ALTER TABLE public.dice_logs DROP CONSTRAINT IF EXISTS dice_logs_msg_type_check;
+ALTER TABLE public.dice_logs ADD CONSTRAINT dice_logs_msg_type_check
+  CHECK (msg_type IN ('check', 'custom', 'damage', 'hidden', 'request', 'note', 'status', 'speech', 'whisper'));
+
+-- 房间发言任何人（含作者本人与 KP）都不可删除：重建 DELETE 策略
+DROP POLICY IF EXISTS "Author or KP can delete dice logs" ON public.dice_logs;
+CREATE POLICY "Author or KP can delete dice logs" ON public.dice_logs
+  FOR DELETE TO authenticated
+  USING (
+    msg_type <> 'speech'
+    AND (user_id = auth.uid() OR public.is_room_creator(room_id, auth.uid()))
+  );
+
+NOTIFY pgrst, 'reload schema';
+
+-- ============================================
+-- 16. 密聊小群系统（KP 发起；已建库的环境执行本节；幂等）
+-- ============================================
+-- 表结构
+CREATE TABLE IF NOT EXISTS public.private_groups (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  room_id UUID REFERENCES public.rooms(id) ON DELETE CASCADE NOT NULL,
+  name TEXT NOT NULL,
+  created_by UUID REFERENCES auth.users(id) NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_private_groups_room ON public.private_groups(room_id);
+
+CREATE TABLE IF NOT EXISTS public.private_group_members (
+  group_id UUID REFERENCES public.private_groups(id) ON DELETE CASCADE NOT NULL,
+  user_id UUID REFERENCES auth.users(id) NOT NULL,
+  can_speak BOOLEAN NOT NULL DEFAULT true,
+  joined_at TIMESTAMPTZ DEFAULT NOW(),
+  PRIMARY KEY (group_id, user_id)
+);
+
+-- SECURITY DEFINER 辅助函数
+CREATE OR REPLACE FUNCTION public.is_private_group_member(p_group_id UUID, p_user_id UUID)
+RETURNS BOOLEAN LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
+AS $$
+  SELECT EXISTS (SELECT 1 FROM public.private_group_members WHERE group_id = p_group_id AND user_id = p_user_id);
+$$;
+
+CREATE OR REPLACE FUNCTION public.is_private_group_speaker(p_group_id UUID, p_user_id UUID)
+RETURNS BOOLEAN LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
+AS $$
+  SELECT EXISTS (SELECT 1 FROM public.private_group_members WHERE group_id = p_group_id AND user_id = p_user_id AND can_speak = true);
+$$;
+
+CREATE OR REPLACE FUNCTION public.is_private_group_room_creator(p_group_id UUID, p_user_id UUID)
+RETURNS BOOLEAN LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
+AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM public.private_groups g
+    JOIN public.rooms r ON r.id = g.room_id
+    WHERE g.id = p_group_id AND r.creator_id = p_user_id
+  );
+$$;
+
+-- private_groups RLS
+ALTER TABLE public.private_groups ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "KP or members can view private groups" ON public.private_groups;
+CREATE POLICY "KP or members can view private groups" ON public.private_groups
+  FOR SELECT TO authenticated
+  USING (
+    public.is_private_group_room_creator(id, auth.uid())
+    OR public.is_private_group_member(id, auth.uid())
+  );
+
+DROP POLICY IF EXISTS "KP can create private groups" ON public.private_groups;
+CREATE POLICY "KP can create private groups" ON public.private_groups
+  FOR INSERT TO authenticated
+  WITH CHECK (public.is_room_creator(room_id, auth.uid()) AND created_by = auth.uid());
+
+DROP POLICY IF EXISTS "KP can update private groups" ON public.private_groups;
+CREATE POLICY "KP can update private groups" ON public.private_groups
+  FOR UPDATE TO authenticated
+  USING (public.is_private_group_room_creator(id, auth.uid()));
+
+DROP POLICY IF EXISTS "KP can delete private groups" ON public.private_groups;
+CREATE POLICY "KP can delete private groups" ON public.private_groups
+  FOR DELETE TO authenticated
+  USING (public.is_private_group_room_creator(id, auth.uid()));
+
+-- private_group_members RLS
+ALTER TABLE public.private_group_members ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "KP or self can view memberships" ON public.private_group_members;
+CREATE POLICY "KP or self can view memberships" ON public.private_group_members
+  FOR SELECT TO authenticated
+  USING (public.is_private_group_room_creator(group_id, auth.uid()) OR user_id = auth.uid());
+
+DROP POLICY IF EXISTS "KP can insert memberships" ON public.private_group_members;
+CREATE POLICY "KP can insert memberships" ON public.private_group_members
+  FOR INSERT TO authenticated
+  WITH CHECK (public.is_private_group_room_creator(group_id, auth.uid()));
+
+DROP POLICY IF EXISTS "KP can update memberships" ON public.private_group_members;
+CREATE POLICY "KP can update memberships" ON public.private_group_members
+  FOR UPDATE TO authenticated
+  USING (public.is_private_group_room_creator(group_id, auth.uid()));
+
+DROP POLICY IF EXISTS "KP can delete memberships" ON public.private_group_members;
+CREATE POLICY "KP can delete memberships" ON public.private_group_members
+  FOR DELETE TO authenticated
+  USING (public.is_private_group_room_creator(group_id, auth.uid()));
+
+-- dice_logs CHECK 约束：旧库约束可能不含 speech / whisper，替换为完整枚举
+ALTER TABLE public.dice_logs DROP CONSTRAINT IF EXISTS dice_logs_msg_type_check;
+ALTER TABLE public.dice_logs
+  ADD CONSTRAINT dice_logs_msg_type_check
+  CHECK (msg_type IN ('check', 'custom', 'damage', 'hidden', 'request', 'note', 'status', 'speech', 'whisper'));
+
+-- dice_logs 读策略：增加 whisper 仅群成员 / KP 可见
+DROP POLICY IF EXISTS "Room members can read dice logs" ON public.dice_logs;
+CREATE POLICY "Room members can read dice logs" ON public.dice_logs
+  FOR SELECT TO authenticated
+  USING (
+    (public.is_room_creator(room_id, auth.uid()) OR public.is_room_member(room_id, auth.uid()))
+    AND (msg_type <> 'hidden' OR public.is_room_creator(room_id, auth.uid()))
+    AND (msg_type <> 'note' OR user_id = auth.uid())
+    AND (
+      msg_type <> 'whisper'
+      OR public.is_room_creator(room_id, auth.uid())
+      OR public.is_private_group_member(CAST(payload->>'group_id' AS UUID), auth.uid())
+    )
+  );
+
+-- dice_logs 写策略：whisper 仅 KP 或该群 can_speak 成员可写
+DROP POLICY IF EXISTS "Room members can insert dice logs" ON public.dice_logs;
+CREATE POLICY "Room members can insert dice logs" ON public.dice_logs
+  FOR INSERT TO authenticated
+  WITH CHECK (
+    (public.is_room_creator(room_id, auth.uid()) OR public.is_room_member(room_id, auth.uid()))
+    AND (msg_type <> 'hidden' OR public.is_room_creator(room_id, auth.uid()))
+    AND (
+      msg_type <> 'whisper'
+      OR public.is_room_creator(room_id, auth.uid())
+      OR public.is_private_group_speaker(CAST(payload->>'group_id' AS UUID), auth.uid())
+    )
+  );
+
+-- Realtime 发布（幂等）
+DO $$
+BEGIN ALTER PUBLICATION supabase_realtime ADD TABLE public.private_groups;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$
+BEGIN ALTER PUBLICATION supabase_realtime ADD TABLE public.private_group_members;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
 NOTIFY pgrst, 'reload schema';

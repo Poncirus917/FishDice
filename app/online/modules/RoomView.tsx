@@ -6,6 +6,7 @@ import { useRoom } from './RoomContext';
 import { useConfirmDialog } from './ConfirmDialog';
 import NpcImportModal from './NpcImportModal';
 import CharacterCardModal from './CharacterCardModal';
+import PrivateChatPanel, { usePrivateGroups } from './PrivateChatPanel';
 import { supabase } from '../../lib/supabase';
 import type { DiceGroup } from '../../utils/dice';
 import type { CharacterState } from '../../(single)/page';
@@ -65,6 +66,33 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
   const [noteModalOpen, setNoteModalOpen] = useState(false);
   const [noteText, setNoteText] = useState('');
   const [noteBusy, setNoteBusy] = useState(false);
+
+  // 发言弹窗（发言对全房间可见）
+  const [speechModalOpen, setSpeechModalOpen] = useState(false);
+  const [speechText, setSpeechText] = useState('');
+  const [speechBusy, setSpeechBusy] = useState(false);
+
+  // LOGS 显示内容过滤：发言 / 掷骰 / 笔记（默认全选；偏好存 localStorage）
+  const [logFilter, setLogFilter] = useState<{ speech: boolean; dice: boolean; note: boolean }>(() => {
+    if (typeof window === 'undefined') return { speech: true, dice: true, note: true };
+    try {
+      const saved = JSON.parse(localStorage.getItem('fish_log_filter') || 'null');
+      if (saved && typeof saved === 'object') {
+        return {
+          speech: saved.speech !== false,
+          dice: saved.dice !== false,
+          note: saved.note !== false,
+        };
+      }
+    } catch { /* 忽略损坏的偏好 */ }
+    return { speech: true, dice: true, note: true };
+  });
+  // LOGS 显示内容设置小弹窗
+  const [logFilterOpen, setLogFilterOpen] = useState(false);
+  // 密聊面板（小弹窗）
+  const [privatePanelOpen, setPrivatePanelOpen] = useState(false);
+  // 密聊群（KP 全部可见；PL 仅自己所属群；实时同步）
+  const { groups: privateGroups, notifyChanged: notifyPrivateChanged } = usePrivateGroups(currentRoom?.id ?? '');
 
   // 调试日志
   useEffect(() => {
@@ -338,6 +366,22 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
   const formatLogTime = (iso: string) =>
     new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 
+  // 日志归入三个显示分类：发言 / 掷骰（检定、自由、伤害、暗骰、请求、状态等）/ 笔记
+  const getLogCategory = (t: DiceLog['msg_type']): 'speech' | 'dice' | 'note' =>
+    t === 'note' ? 'note' : (t === 'speech' || t === 'whisper') ? 'speech' : 'dice';
+
+  // LOGS 面板当前实际展示的日志（受设置弹窗的复选框控制）
+  const visibleDiceLogs = diceLogs.filter(l => logFilter[getLogCategory(l.msg_type)]);
+
+  // 切换某分类显示并持久化偏好
+  const toggleLogFilter = (key: 'speech' | 'dice' | 'note') => {
+    setLogFilter(prev => {
+      const next = { ...prev, [key]: !prev[key] };
+      try { localStorage.setItem('fish_log_filter', JSON.stringify(next)); } catch { /* 忽略 */ }
+      return next;
+    });
+  };
+
   // 掷骰结果悬浮提示队列：新骰子从底部入队、先出现的被顶上去，6 秒后自动消失
   const [rollToasts, setRollToasts] = useState<DiceLog[]>([]);
   // 已弹过提示的日志 id（防止重复弹出）
@@ -368,6 +412,11 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
   // 删除单条记录：KP 可删任何掷骰记录，PL 只能删自己的笔记（RLS：作者或 KP 可删）。
   // 删除后通过 postgres_changes DELETE 事件 + dice_log_deleted 广播双通道同步到所有客户端
   const handleDeleteLog = (log: DiceLog) => {
+    // 房间发言任何人都不可删除
+    if (log.msg_type === 'speech') {
+      toast('房间发言不可删除');
+      return;
+    }
     const isMyNote = log.msg_type === 'note' && log.user_id === userId;
     showConfirm({
       title: isMyNote ? '删除笔记' : '删除掷骰记录',
@@ -419,22 +468,57 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
     }
   };
 
-  // 导出掷骰记录为 TXT（含自己的私有笔记；格式参考单机版）
+  // 保存发言（msg_type='speech'，房间全体成员可读，随 Realtime 实时同步）
+  const handleSaveSpeech = async () => {
+    if (!currentRoom) return;
+    const text = speechText.trim();
+    if (!text) {
+      toast('请输入发言内容');
+      return;
+    }
+    setSpeechBusy(true);
+    try {
+      const myChar = myCharacterId ? allCharacters[myCharacterId] : null;
+      await insertDiceLog({
+        room_id: currentRoom.id,
+        user_id: userId,
+        character_id: isCreator ? null : myCharacterId,
+        char_name: isCreator ? '守秘人' : (myChar?.name || displayName),
+        msg_type: 'speech',
+        label: '发言',
+        level: text,
+      });
+      setSpeechModalOpen(false);
+      setSpeechText('');
+    } catch (err: any) {
+      toast.error(err.message || '发送失败');
+    } finally {
+      setSpeechBusy(false);
+    }
+  };
+
+  // 导出掷骰记录为 TXT：内容随 LOGS 当前显示状态（发言 / 掷骰 / 笔记）过滤
   const exportLogs = () => {
-    if (!currentRoom || diceLogs.length === 0) return;
+    if (!currentRoom || visibleDiceLogs.length === 0) return;
 
     const now = new Date();
     const dateStr = now.toISOString().split('T')[0];
     const fileName = `log_${dateStr}_${now.getHours()}${now.getMinutes()}.txt`;
     const header = `--- COC Dice Log Export (${now.toLocaleString()}) ---\n\n`;
 
-    const content = diceLogs.map(log => {
+    const content = visibleDiceLogs.map(log => {
       const sender = currentRoom.members.find(m => m.user_id === log.user_id);
       const name = (isCreator && log.user_id === currentRoom.creator_id)
         ? '守秘人'
         : (log.char_name || sender?.profile?.display_name || '未知');
       const time = formatLogTime(log.created_at);
 
+      if (log.msg_type === 'whisper') {
+        return `[${time}] ${name} - 密聊(${log.label || ''}): ${log.level || ''}`;
+      }
+      if (log.msg_type === 'speech') {
+        return `[${time}] ${name} - 发言: ${log.level || ''}`;
+      }
       if (log.msg_type === 'note') {
         return `[${time}] ${name} - 记录: ${log.level || ''}`;
       }
@@ -469,14 +553,20 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
       : (log.char_name || sender?.profile?.display_name || '未知');
     const isCheckType = log.msg_type === 'check' || log.msg_type === 'hidden';
     const isNote = log.msg_type === 'note';
+    const isSpeech = log.msg_type === 'speech';
+    const isWhisper = log.msg_type === 'whisper';
 
     return (
       <div
         key={log.id}
         className={`group relative p-2.5 rounded-lg border transition-all ${
-          isNote
-            ? 'bg-cyan-950/30 border-cyan-900/50'
-            : 'bg-slate-800/70 border-slate-700/60'
+          isWhisper
+            ? 'bg-red-950/50 border-red-900/70'
+            : isSpeech
+              ? 'bg-blue-950/40 border-blue-900/60'
+              : isNote
+                ? 'bg-cyan-950/30 border-cyan-900/50'
+                : 'bg-slate-800/70 border-slate-700/60'
         }`}
       >
         {showDelete && (
@@ -492,6 +582,8 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
         <div className="flex justify-between items-start mb-1 gap-2">
           <div className="text-slate-500 text-[9px] font-mono flex items-center gap-1.5 pt-0.5">
             {formatLogTime(log.created_at)}
+            {isWhisper && <span className="text-red-400/90">🤫 密聊·{log.label}</span>}
+            {isSpeech && <span className="text-blue-400">💬 房间发言</span>}
             {isNote && <span className="text-cyan-600">📝 仅自己可见</span>}
           </div>
           <div className="text-[11px] font-black px-1.5 py-0.5 bg-slate-700/80 text-slate-300 rounded tracking-tight flex-shrink-0">
@@ -532,6 +624,14 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
               <div className="font-black text-[15px] text-cyan-300 flex-shrink-0">{log.roll}</div>
             </div>
           </>
+        ) : isWhisper ? (
+          <div className="text-[13px] text-red-100/90 whitespace-pre-wrap break-words leading-relaxed">
+            {log.level}
+          </div>
+        ) : isSpeech ? (
+          <div className="text-[13px] text-blue-100/90 whitespace-pre-wrap break-words leading-relaxed">
+            {log.level}
+          </div>
         ) : isNote ? (
           <div className="text-[13px] text-cyan-100/90 whitespace-pre-wrap break-words leading-relaxed">
             {log.level}
@@ -1362,22 +1462,28 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
             logsTouched ? 'bg-slate-900' : 'bg-slate-900/70'
           }`}
         >
-          {/* 头部：标题 + 笔记 / 导出 / 关闭 */}
+          {/* 头部：标题 + 设置 / 导出 / 关闭（笔记按钮已移至右下角悬浮按钮） */}
           <div className="px-4 py-3 border-b border-slate-700 flex items-center gap-2 flex-shrink-0">
             <span>📜</span>
-            <span className="font-bold text-sm">掷骰记录</span>
-            <span className="text-[10px] text-slate-500">{diceLogs.length}</span>
+            <span className="font-bold text-sm">历史记录</span>
+            <span className="text-[10px] text-slate-500">
+              {visibleDiceLogs.length}{diceLogs.length !== visibleDiceLogs.length && `/${diceLogs.length}`}
+            </span>
             <div className="ml-auto flex items-center gap-1.5">
               <button
-                onClick={() => setNoteModalOpen(true)}
-                title="添加私有笔记（仅自己可见）"
-                className="px-2 py-1 rounded-md bg-slate-800 hover:bg-slate-700 border border-slate-700 text-[10px] font-bold text-cyan-300 transition"
+                onClick={() => setLogFilterOpen(v => !v)}
+                title="设置显示内容"
+                className={`w-7 h-7 rounded-md border text-xs transition ${
+                  logFilterOpen
+                    ? 'bg-cyan-700 border-cyan-600 text-white'
+                    : 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-300'
+                }`}
               >
-                ✏️ 笔记
+                ⚙
               </button>
               <button
                 onClick={exportLogs}
-                title="导出为 TXT（含自己的笔记）"
+                title="导出为 TXT（按当前显示内容）"
                 className="px-2 py-1 rounded-md bg-slate-800 hover:bg-slate-700 border border-slate-700 text-[10px] font-bold text-cyan-300 transition"
               >
                 ⬇ EXPORT TXT
@@ -1392,24 +1498,29 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
             </div>
           </div>
 
-          {/* 日志列表（单机版卡片式渲染） */}
+          {/* 日志列表（单机版卡片式渲染，按设置过滤） */}
           <div ref={logListRef} className="flex-1 overflow-y-auto p-3 space-y-2">
-            {diceLogs.length === 0 && (
+            {visibleDiceLogs.length === 0 && (
               <p className="text-center text-slate-600 text-xs py-10 italic">
-                暂无掷骰记录，等待第一掷…
+                {diceLogs.length === 0 ? '暂无掷骰记录，等待第一掷…' : '当前筛选条件下没有记录'}
               </p>
             )}
 
-            {diceLogs.map(log =>
-              renderLogCard(log, isCreator || (log.msg_type === 'note' && log.user_id === userId))
+            {visibleDiceLogs.map(log =>
+              renderLogCard(
+                log,
+                // 房间发言任何人（含 KP）都不可删除
+                log.msg_type !== 'speech' && (isCreator || (log.msg_type === 'note' && log.user_id === userId))
+              )
             )}
           </div>
         </aside>
       )}
 
       {/* 掷骰结果悬浮提示：底部掷骰面板之上锚定堆叠——新骰子入队把先出现的顶上去；
-          左上角圆环为 6 秒剩余时间，点击提示可展开完整记录侧栏 */}
-      <div className="fixed right-6 bottom-[calc(33vh+1.25rem)] z-[45] w-[420px] max-w-[80vw] flex flex-col gap-2 pointer-events-none">
+          左上角圆环为 6 秒剩余时间，点击提示可展开完整记录侧栏。
+          右缘避让发言/笔记圆形按钮（w-11 + 间距） */}
+      <div className="fixed right-[5.75rem] bottom-[calc(33vh+1.25rem)] z-[45] w-[420px] max-w-[70vw] flex flex-col gap-2 pointer-events-none">
         {rollToasts.map(log => (
           <div
             key={log.id}
@@ -1436,6 +1547,110 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
           </div>
         ))}
       </div>
+
+      {/* 左侧悬浮按钮组（紧贴左侧角色栏右侧）：密聊（暗红，上）/ 笔记（棕色）/ 发言（蓝色，下）；
+          位于底部掷骰面板之上。密聊按钮：KP 常显；PL 仅在被 KP 拉入密聊群后出现 */}
+      <div
+        className="fixed left-[21rem] z-[46] bottom-[calc(33vh+1.5rem)] flex flex-col items-center gap-2.5"
+      >
+        {(isCreator || privateGroups.length > 0) && (
+          <button
+            onClick={() => setPrivatePanelOpen(v => !v)}
+            title={isCreator ? '密聊（创建 / 管理密聊群）' : '密聊'}
+            className={`w-11 h-11 rounded-full shadow-lg shadow-black/40 flex items-center justify-center transition active:scale-95 ${
+              privatePanelOpen
+                ? 'bg-red-800 ring-2 ring-red-500/60'
+                : 'bg-red-950 hover:bg-red-900'
+            }`}
+          >
+            <span className="text-[11px] font-black text-red-100">密聊</span>
+          </button>
+        )}
+        <button
+          onClick={() => setNoteModalOpen(true)}
+          title="添加私有笔记（仅自己可见）"
+          className="w-11 h-11 rounded-full bg-amber-800 hover:bg-amber-700 shadow-lg shadow-black/40 flex items-center justify-center transition active:scale-95"
+        >
+          <span className="text-[11px] font-black text-amber-50">笔记</span>
+        </button>
+        <button
+          onClick={() => setSpeechModalOpen(true)}
+          title="发言（全房间可见）"
+          className="w-11 h-11 rounded-full bg-blue-600 hover:bg-blue-500 shadow-lg shadow-black/40 flex items-center justify-center transition active:scale-95"
+        >
+          <span className="text-[11px] font-black text-blue-50">发言</span>
+        </button>
+      </div>
+
+      {/* 密聊小弹窗：选择当前发言群 / KP 建群、禁言、解散 */}
+      {privatePanelOpen && (
+        <PrivateChatPanel
+          roomId={currentRoom.id}
+          userId={userId}
+          isCreator={isCreator}
+          senderName={isCreator ? '守秘人' : displayName}
+          members={currentRoom.members}
+          groups={privateGroups}
+          notifyChanged={notifyPrivateChanged}
+          onClose={() => setPrivatePanelOpen(false)}
+        />
+      )}
+
+      {/* LOGS 显示内容设置：右侧跳出小弹窗（发言 / 掷骰 / 笔记，默认全选；TXT 导出同步遵循） */}
+      {logFilterOpen && (
+        <>
+          {/* 透明点击层：点击弹窗外部关闭 */}
+          <div className="fixed inset-0 z-[55]" onClick={() => setLogFilterOpen(false)} />
+          <div className="popup-slide-right fixed right-4 top-[20%] z-[56] w-60 bg-slate-800 border border-slate-700 rounded-2xl shadow-2xl p-4">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-sm font-bold text-slate-200">显示内容</h3>
+              <button
+                onClick={() => setLogFilterOpen(false)}
+                className="text-slate-500 hover:text-white text-xs"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="space-y-1">
+              {([
+                { key: 'speech', icon: '💬', label: '发言' },
+                { key: 'dice', icon: '🎲', label: '掷骰' },
+                { key: 'note', icon: '📝', label: '笔记' },
+              ] as const).map(item => {
+                const checked = logFilter[item.key];
+                return (
+                  <label
+                    key={item.key}
+                    className="flex items-center gap-2.5 px-2 py-2 rounded-lg hover:bg-slate-700/60 cursor-pointer transition"
+                  >
+                    <span
+                      className={`w-4 h-4 rounded border flex items-center justify-center text-[10px] flex-shrink-0 transition ${
+                        checked
+                          ? 'bg-cyan-600 border-cyan-500 text-white'
+                          : 'bg-slate-900 border-slate-600 text-transparent'
+                      }`}
+                    >
+                      ✓
+                    </span>
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      onChange={() => toggleLogFilter(item.key)}
+                      className="sr-only"
+                    />
+                    <span className="text-xs">{item.icon} {item.label}</span>
+                  </label>
+                );
+              })}
+            </div>
+
+            <p className="mt-3 pt-3 border-t border-slate-700/70 text-[10px] text-slate-500 leading-relaxed">
+              设置会即时生效，EXPORT TXT 导出的内容也按当前显示状态过滤。
+            </p>
+          </div>
+        </>
+      )}
 
       {Dialog}
 
@@ -1486,6 +1701,63 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
                   className="flex-[2] py-2.5 bg-cyan-600 hover:bg-cyan-500 text-white rounded-xl font-bold transition disabled:opacity-50"
                 >
                   {noteBusy ? '保存中...' : '保存并记录'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 发言弹窗（内容对全房间可见，实时同步到 LOGS） */}
+      {speechModalOpen && (
+        <div
+          className="fixed inset-0 z-[70] flex items-center justify-center bg-slate-900/60 backdrop-blur-sm p-4"
+          onClick={() => { if (!speechBusy) setSpeechModalOpen(false); }}
+        >
+          <div
+            className="bg-slate-800 border border-slate-700 rounded-2xl shadow-2xl w-full max-w-md overflow-hidden"
+            onClick={e => e.stopPropagation()}
+          >
+            <div className="p-4 border-b border-slate-700 flex justify-between items-center">
+              <h3 className="font-bold text-white">💬 房间发言</h3>
+              <button
+                onClick={() => setSpeechModalOpen(false)}
+                disabled={speechBusy}
+                className="text-slate-400 hover:text-white disabled:opacity-50"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="p-4">
+              <p className="text-[11px] text-slate-500 mb-2">
+                发言将展示给房间内所有成员，并记录在 LOGS 中。
+              </p>
+              <textarea
+                autoFocus
+                value={speechText}
+                onChange={e => setSpeechText(e.target.value)}
+                onKeyDown={e => {
+                  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) handleSaveSpeech();
+                }}
+                placeholder="说点什么…（Ctrl+Enter 发送）"
+                className="w-full h-32 p-3 bg-slate-900/70 border border-slate-700 rounded-xl text-sm text-white outline-none focus:border-blue-500 resize-none transition"
+              />
+
+              <div className="mt-4 flex gap-3">
+                <button
+                  onClick={() => setSpeechModalOpen(false)}
+                  disabled={speechBusy}
+                  className="flex-1 py-2.5 rounded-xl font-bold text-slate-400 hover:bg-slate-700 transition disabled:opacity-50"
+                >
+                  取消
+                </button>
+                <button
+                  onClick={handleSaveSpeech}
+                  disabled={speechBusy}
+                  className="flex-[2] py-2.5 bg-blue-600 hover:bg-blue-500 text-white rounded-xl font-bold transition disabled:opacity-50"
+                >
+                  {speechBusy ? '发送中...' : '发送'}
                 </button>
               </div>
             </div>
@@ -1693,7 +1965,7 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
               </button>
               <button
                 onClick={() => { setRoomSettingsOpen(false); handleDeleteRoom(); }}
-                className="w-full py-3 bg-red-800 hover:bg-red-500 rounded-xl font-bold transition text-sm"
+                className="w-full py-3 bg-red-900 hover:bg-red-100 rounded-xl font-bold transition text-sm"
               >
                 🗑 删除房间
               </button>

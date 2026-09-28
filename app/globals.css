@@ -45,3 +45,13 @@ body {
 .dice-toast-ring {
   animation: dice-toast-ring 6s linear forwards;
 }
+
+/* 右侧小弹窗滑入（LOGS 显示内容设置） */
+@keyframes popup-slide-right {
+  from { opacity: 0; transform: translateX(24px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+.popup-slide-right {
+  animation: popup-slide-right 0.2s ease-out both;
+}
