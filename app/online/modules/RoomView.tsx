@@ -302,7 +302,10 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
       return { entryId: entry.id, character, display };
     })
     .filter((x): x is { entryId: string; character: CharacterState; display: string } => x !== null);
-  const kpCanCheck = npcOptions.length > 0;
+  const kpCanCheck = npcOptions.length > 0 || !!(isCreator && myCharacterId && allCharacters[myCharacterId]);
+
+  // KP 导入的 KPC（KP 扮演的 PC 角色）：可参与技能检定
+  const kpcCharacter = isCreator && myCharacterId ? allCharacters[myCharacterId] ?? null : null;
 
   // KP 发言/密聊时的角色选项：守秘人 / KPC / NPC / 怪物
   const kpCharOptions: Array<{ name: string | null; label: string }> = [
@@ -331,10 +334,10 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
     return npcOptions.find(o => o.display === kpSelectedCharName)?.character ?? null;
   })();
 
-  // KP 没有可代掷角色时自动切到自由掷骰页签（检定行为必须绑定角色）
+  // KP 没有任何可代掷角色（无 NPC/怪物且未导入 KPC）时自动切到自由掷骰页签（检定行为必须绑定角色）
   useEffect(() => {
-    if (isCreator && npcOptions.length === 0) setRollTab('custom');
-  }, [isCreator, npcOptions.length]);
+    if (isCreator && npcOptions.length === 0 && !kpcCharacter) setRollTab('custom');
+  }, [isCreator, npcOptions.length, kpcCharacter]);
 
   // 检定：手动填写检定项目与目标值发起 1D100；KP 必须选定代掷的 NPC/怪物
   const handlePerformCheck = async () => {
@@ -352,16 +355,23 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
 
     try {
       if (isCreator) {
-        const opt = npcOptions.find(o => o.entryId === selectedEntryId) || npcOptions[0];
-        if (!opt) {
-          toast('没有可代掷的 NPC/怪物，请使用自由掷骰');
+        // 代掷目标优先级：下拉所选（NPC/怪物实例或 KPC）→ 第一个 NPC 实例 → KPC
+        const opt = npcOptions.find(o => o.entryId === selectedEntryId);
+        const pick = selectedEntryId === 'kpc'
+          ? kpcCharacter
+          : opt?.character ?? npcOptions[0]?.character ?? kpcCharacter;
+        const pickName = selectedEntryId === 'kpc'
+          ? kpcCharacter?.name
+          : opt?.display ?? npcOptions[0]?.display ?? kpcCharacter?.name;
+        if (!pick) {
+          toast('没有可代掷的角色，请使用自由掷骰');
           return;
         }
         await performCheck({
           label,
           target,
-          characterId: opt.character.id,
-          charName: opt.display,
+          characterId: pick.id,
+          charName: pickName || pick.name,
         });
       } else {
         const myChar = myCharacterId ? allCharacters[myCharacterId] : null;
@@ -747,8 +757,12 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
               <div className={`font-black text-lg italic flex-shrink-0 ${getLevelClass(log.level)}`}>{log.level}</div>
             </div>
           ) : log.msg_type === 'custom' ? (
-            <div className="flex items-baseline justify-between gap-3">
-              <div className="font-bold text-base text-slate-100 min-w-0 truncate">{log.label}</div>
+            <div className="flex items-center justify-between gap-3 min-w-0">
+              <div className="min-w-0">
+                <div className="font-bold text-base text-slate-100 truncate">{log.label}</div>
+                {/* 完整过程：2D6+1D4+2 = 3+2+2 = 9 */}
+                <div className="font-mono text-xs text-slate-400 truncate">{log.level}</div>
+              </div>
               <div className="font-black text-lg text-cyan-300 flex-shrink-0">{log.roll}</div>
             </div>
           ) : isWhisper || isSpeech ? (
@@ -1729,7 +1743,7 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
             </div>
             {isCreator && !kpCanCheck && (
               <p className="text-[11px] text-amber-500/80 leading-tight">
-                检定类掷骰必须绑定角色：请先在左侧导入 NPC / 怪物并加入房间
+                检定类掷骰必须绑定角色：请先导入 KPC，或在左侧添加 NPC / 怪物并加入房间
               </p>
             )}
           </div>
@@ -1741,10 +1755,13 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
                 <div className="flex items-center gap-2 flex-shrink-0">
                   <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest">代掷角色</span>
                   <select
-                    value={selectedEntryId || npcOptions[0]?.entryId || ''}
+                    value={selectedEntryId || npcOptions[0]?.entryId || (kpcCharacter ? 'kpc' : '')}
                     onChange={e => setSelectedEntryId(e.target.value)}
                     className="w-44 bg-slate-900/70 border border-slate-700 rounded-xl px-3 py-2.5 text-sm outline-none focus:border-cyan-500"
                   >
+                    {kpcCharacter && (
+                      <option key="kpc" value="kpc">KPC·{kpcCharacter.name}</option>
+                    )}
                     {npcOptions.map(o => (
                       <option key={o.entryId} value={o.entryId}>
                         {o.character.type === 'mob' ? '怪物·' : 'NPC·'}{o.display}
@@ -1818,6 +1835,8 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
                 <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest flex-shrink-0">骰子组</span>
                 {freeDiceGroups.map((group, index) => (
                   <div key={index} className="flex items-center gap-1.5">
+                    {/* 多组骰子之间显示 + 号，明确"相加"关系 */}
+                    {index > 0 && <span className="font-black text-cyan-400/80">+</span>}
                     <input
                       type="number"
                       min={1}
@@ -1858,9 +1877,9 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
         </div>
       </div>
 
-      {/* 掷骰结果 / 发言悬浮弹窗：掷骰框上方靠左锚定堆叠——新弹窗入队把先出现的顶上去，
-          左侧头像 + 右侧内容框，左上角圆环为 10 秒剩余时间；左缘与掷骰面板对齐 */}
-      <div className="fixed left-[19rem] bottom-[calc(25vh+1.25rem)] z-[45] w-[34rem] max-w-[calc(100vw-44.5rem)] flex flex-col gap-3 pointer-events-none">
+      {/* 掷骰结果 / 发言悬浮弹窗：掷骰框上方锚定堆叠——新弹窗入队把先出现的顶上去，
+          左侧头像 + 右侧内容框，左上角圆环为 10 秒剩余时间；左右缘与掷骰面板对齐（右侧贴近聊天记录栏） */}
+      <div className="fixed left-[19rem] right-[24rem] bottom-[calc(25vh+1.25rem)] z-[45] flex flex-col gap-3 pointer-events-none">
         {rollToasts.map(log => renderToastCard(log))}
       </div>
 
@@ -2170,7 +2189,7 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
               </button>
               <button
                 onClick={() => { setRoomSettingsOpen(false); handleDeleteRoom(); }}
-                className="w-full py-3 bg-red-900 hover:bg-red-100 rounded-xl font-bold transition text-sm"
+                className="w-full py-3 bg-red-900 hover:bg-red-900 rounded-xl font-bold transition text-sm"
               >
                 🗑 删除房间
               </button>

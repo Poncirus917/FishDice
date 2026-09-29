@@ -2,6 +2,7 @@
 
 import { useState, useEffect } from 'react';
 import toast from 'react-hot-toast';
+import Swal from 'sweetalert2';
 import { supabase } from '../../lib/supabase';
 import { DEFAULT_AVATAR } from '../../lib/constants';
 import type { CharacterState } from '../../(single)/page';
@@ -16,6 +17,22 @@ interface KpcImportModalProps {
 // KP 从角色库选一个 PC 作为 KPC（仅限一个）
 export default function KpcImportModal({ userId, busy, onSelect, onClose }: KpcImportModalProps) {
   const [pcChars, setPcChars] = useState<CharacterState[]>([]);
+
+  // 选择前二次确认：KPC 导入后不可更换或移除
+  const confirmSelect = (char: CharacterState) => {
+    Swal.fire({
+      title: '确认导入 KPC',
+      html: `确定将「<b class="text-purple-400">${char.name}</b>」设为 KPC 吗？<br/><span class="text-xs text-slate-400">KPC 导入后不可更换或移除，请在确认前慎重选择。</span>`,
+      icon: 'question',
+      showCancelButton: true,
+      confirmButtonColor: '#7e22ce',
+      cancelButtonColor: '#475569',
+      confirmButtonText: '确认导入',
+      cancelButtonText: '取消',
+    }).then(result => {
+      if (result.isConfirmed) onSelect(char.id);
+    });
+  };
 
   useEffect(() => {
     (async () => {
@@ -72,7 +89,7 @@ export default function KpcImportModal({ userId, busy, onSelect, onClose }: KpcI
                   <span className="text-sm font-bold text-white truncate">{char.name}</span>
                 </div>
                 <button
-                  onClick={() => onSelect(char.id)}
+                  onClick={() => confirmSelect(char)}
                   disabled={busy}
                   className="px-3 py-1.5 rounded-lg text-[11px] font-bold bg-purple-600 hover:bg-purple-500 text-white disabled:opacity-50 transition"
                 >
