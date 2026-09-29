@@ -4,18 +4,27 @@ import Sidebar from '../components/Sidebar';
 import ImportView from './views/ImportView';
 import ConsoleView from './views/ConsoleView';
 
-// 武器的伤害组成：一段 XDY 骰子（最多 3 段相加）
+// 武器的伤害组成：一段 XDY 骰子（最多 3 段相加）+ 可选固定加成
 export interface WeaponDicePart {
   count: number;
   sides: number;
+  bonus?: number; // 固定数值加成（如 "2D6+3" 中的 +3）
 }
+
+// DB（伤害加值）类型
+export type DBType = 'none' | 'half' | 'full';
+
+// 武器附加状态效果
+export type StatusEffect = 'none' | 'burn' | 'stun' | 'burn_stun';
 
 // 角色武器（最多 6 把，含默认"肉搏"）
 export interface Weapon {
   name: string;
   skill: string;              // 使用技能（须为技能列表中存在的技能）
-  type: 'melee' | 'ranged';   // 近战 / 远程
-  damage: WeaponDicePart[];   // 伤害骰子段；近战结算时自动追加伤害加值（DB）
+  type: 'melee' | 'ranged';   // 近战 / 远程（保留展示与其他机制用）
+  damage: WeaponDicePart[];   // 伤害骰子段（最多 3 段），每段可选 +固定数值
+  dbType?: DBType;            // 伤害加值类型：无 / 0.5DB / 1DB；旧数据未填时 melee→full, ranged→none
+  statusEffect?: StatusEffect; // 附加状态效果（燃烧 / 眩晕 / 两者）
   attacks: number;            // 一回合内可使用次数
   multi: boolean;             // 一次攻击可否打多人
   malfunction: number | null; // 故障值，null = 无

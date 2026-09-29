@@ -76,44 +76,71 @@ const decodeWeaponV4 = (s: string): Weapon | null => {
   };
 };
 
-// v5 短码格式：name~skillEnc~m/r~1D3+1D6~encVal~multi~encVal(''=无)
+// v5 短码格式：name~skillEnc~m/r~1D3+1D6+3~encVal~multi~encVal(''=无)~db(n/h/f)~status(n/b/s/x)
+// (decodeWeaponV5 定义在下方，含 dbType/statusEffect 扩展字段)
+
+// "1D3+1D6" / "2D6+3" → [{count:1,sides:3},{count:1,sides:6}] / [{count:2,sides:6,bonus:3}]
+const parseDamage = (dmg: string): Array<{ count: number; sides: number; bonus?: number }> =>
+  dmg
+    .split('+')
+    .map(p => {
+      const m = p.trim().match(/^(\d+)D(\d+)(?:\+(\d+))?$/i);
+      if (!m) return null;
+      const seg: { count: number; sides: number; bonus?: number } = {
+        count: parseInt(m[1]), sides: parseInt(m[2]),
+      };
+      if (m[3]) seg.bonus = parseInt(m[3]);
+      return seg;
+    })
+    .filter((d): d is { count: number; sides: number; bonus?: number } => d !== null);
+
+// DB 类型编码：无DB='n', 0.5DB='h', 1DB='f'
+const encDb = (t?: 'none' | 'half' | 'full') =>
+  t === 'half' ? 'h' : t === 'full' ? 'f' : 'n';
+const decDb = (s: string): 'none' | 'half' | 'full' =>
+  s === 'h' ? 'half' : s === 'f' ? 'full' : 'none';
+
+// 状态效果编码：无='n', 燃烧='b', 眩晕='s', 两者='x'
+const encSe = (s?: 'none' | 'burn' | 'stun' | 'burn_stun') =>
+  s === 'burn' ? 'b' : s === 'stun' ? 's' : s === 'burn_stun' ? 'x' : 'n';
+const decSe = (s: string): 'none' | 'burn' | 'stun' | 'burn_stun' =>
+  s === 'b' ? 'burn' : s === 's' ? 'stun' : s === 'x' ? 'burn_stun' : 'none';
+
+// v5 武器编码：name~skillEnc~m/r~1D3+1D6+3~encVal~multi~encVal(''=无)~db(n/h/f)~status(n/b/s/x)
+const encodeWeaponV5 = (w: Weapon): string => [
+  w.name,
+  encSkillName(w.skill),
+  w.type === 'melee' ? 'm' : 'r',
+  w.damage.map(d => d.bonus ? `${d.count}D${d.sides}+${d.bonus}` : `${d.count}D${d.sides}`).join('+'),
+  encVal(w.attacks),
+  w.multi ? '1' : '0',
+  w.malfunction == null ? '' : encVal(w.malfunction),
+  encDb(w.dbType),
+  encSe(w.statusEffect),
+].join('~');
+
 const decodeWeaponV5 = (s: string): Weapon | null => {
   const seg = s.split('~');
   if (seg.length < 7) return null;
-  const [name, skillEnc, typeChar, dmg, attacksEnc, multi, malEnc] = seg;
+  const [name, skillEnc, typeChar, dmg, attacksEnc, multi, malEnc, dbChar, seChar] = seg;
 
   const skill = decSkillName(skillEnc);
   const damage = parseDamage(dmg);
+  // 向后兼容：旧码没带 dbType / statusEffect
+  const dbType = dbChar ? decDb(dbChar) : (typeChar === 'm' ? 'full' : 'none');
+  const statusEffect = seChar ? decSe(seChar) : 'none';
   return {
     name,
     skill: skill || '',
     type: typeChar === 'r' ? 'ranged' : 'melee',
     damage: damage.length ? damage : [{ count: 1, sides: 3 }],
+    dbType,
+    statusEffect,
     attacks: Math.max(1, decVal(attacksEnc, 0) || 1),
     multi: multi === '1',
     malfunction: malEnc === '' || malEnc === undefined ? null : decVal(malEnc, 0) || null,
   };
 };
-
-// "1D3+1D6" → [{count:1,sides:3},{count:1,sides:6}]
-const parseDamage = (dmg: string): Array<{ count: number; sides: number }> =>
-  dmg
-    .split('+')
-    .map(p => {
-      const m = p.trim().match(/^(\d+)D(\d+)$/i);
-      return m ? { count: parseInt(m[1]), sides: parseInt(m[2]) } : null;
-    })
-    .filter((d): d is { count: number; sides: number } => d !== null);
-
-const encodeWeaponV5 = (w: Weapon): string => [
-  w.name,
-  encSkillName(w.skill),
-  w.type === 'melee' ? 'm' : 'r',
-  w.damage.map(d => `${d.count}D${d.sides}`).join('+'),
-  encVal(w.attacks),
-  w.multi ? '1' : '0',
-  w.malfunction == null ? '' : encVal(w.malfunction),
-].join('~');
 
 // ---------- v6：base64url / deflate 基础工具 ----------
 const bytesToBase64Url = (bytes: Uint8Array<ArrayBuffer>): string => {
@@ -154,8 +181,11 @@ const V6_FLAG_BACKGROUNDS = 2;
 const V6_FLAG_POSSESSIONS = 4;
 const V6_FLAG_SPELLS = 8;
 const V6_FLAG_WEAPONS = 16;
+const V6_FLAG_WEAPON_EXTRA = 32; // 武器扩展字段：每段骰子 bonus + dbType + statusEffect
 const V6_CUSTOM_SKILL = 0xff; // 技能索引占位：自定义技能（后跟字符串）
 const V6_NO_MALFUNCTION = 0xffff; // 无故障值
+// dbType 编码：0=none, 1=half, 2=full
+// statusEffect 编码：0=none, 1=burn, 2=stun, 3=burn_stun
 
 const encU16 = (buf: number[], v: number) => {
   const x = Math.max(0, Math.min(65535, Math.round(v || 0)));
@@ -183,6 +213,13 @@ async function encodeV6(character: CharacterState): Promise<string> {
   if (poss.length > 0) flags |= V6_FLAG_POSSESSIONS;
   if (spells.length > 0) flags |= V6_FLAG_SPELLS;
   if (weapons.length > 0) flags |= V6_FLAG_WEAPONS;
+  // 任何武器有扩展字段则置位（bonus / dbType / statusEffect 非默认）
+  const wHasExtra = weapons.some(w => {
+    if (w.dbType && w.dbType !== (w.type === 'melee' ? 'full' : 'none')) return true;
+    if (w.statusEffect && w.statusEffect !== 'none') return true;
+    return w.damage.some(d => (d.bonus ?? 0) !== 0);
+  });
+  if (weapons.length > 0 && wHasExtra) flags |= V6_FLAG_WEAPON_EXTRA;
 
   // 头部：版本 + flags + 名称 + 类型
   buf.push(6, flags);
@@ -231,6 +268,14 @@ async function encodeV6(character: CharacterState): Promise<string> {
       buf.push(segs.length);
       for (const d of segs) {
         buf.push(Math.max(0, Math.min(255, d.count)), Math.max(0, Math.min(255, d.sides)));
+      }
+      // 扩展字段：每段 bonus（0 表示无）+ dbType byte + statusEffect byte
+      if (flags & V6_FLAG_WEAPON_EXTRA) {
+        for (const d of segs) buf.push(Math.max(0, Math.min(255, d.bonus ?? 0)));
+        const dbType = w.dbType ?? (w.type === 'melee' ? 'full' : 'none');
+        buf.push(dbType === 'half' ? 1 : dbType === 'full' ? 2 : 0);
+        const se = w.statusEffect ?? 'none';
+        buf.push(se === 'burn' ? 1 : se === 'stun' ? 2 : se === 'burn_stun' ? 3 : 0);
       }
       encU16(buf, w.attacks);
       buf.push(w.multi ? 1 : 0);
@@ -322,14 +367,28 @@ async function decodeV6(encoded: string): Promise<Omit<CharacterState, 'id'> | n
     if (flags & V6_FLAG_WEAPONS) {
       const count = rU8();
       const list: Weapon[] = [];
+      const hasExtra = (flags & V6_FLAG_WEAPON_EXTRA) !== 0;
       for (let i = 0; i < count; i++) {
         const wname = rStr();
         const wsidx = rU8();
         const wskill = wsidx === V6_CUSTOM_SKILL ? rStr() : (SKILL_DICT[wsidx] ?? '');
         const wtype = rU8() === 1 ? 'ranged' : 'melee';
         const segCount = rU8();
-        const damage: Array<{ count: number; sides: number }> = [];
+        const damage: Array<{ count: number; sides: number; bonus?: number }> = [];
         for (let s = 0; s < segCount; s++) damage.push({ count: rU8(), sides: rU8() });
+        // 扩展字段（bonus / dbType / statusEffect）
+        let dbType: 'none' | 'half' | 'full' = wtype === 'melee' ? 'full' : 'none';
+        let statusEffect: 'none' | 'burn' | 'stun' | 'burn_stun' = 'none';
+        if (hasExtra) {
+          for (let s = 0; s < segCount; s++) {
+            const b = rU8();
+            if (b) damage[s].bonus = b;
+          }
+          const dbByte = rU8();
+          dbType = dbByte === 1 ? 'half' : dbByte === 2 ? 'full' : 'none';
+          const seByte = rU8();
+          statusEffect = seByte === 1 ? 'burn' : seByte === 2 ? 'stun' : seByte === 3 ? 'burn_stun' : 'none';
+        }
         const attacks = rU16();
         const multi = rU8() === 1;
         const malRaw = rU16();
@@ -338,6 +397,8 @@ async function decodeV6(encoded: string): Promise<Omit<CharacterState, 'id'> | n
           skill: wskill || '',
           type: wtype,
           damage: damage.length ? damage : [{ count: 1, sides: 3 }],
+          dbType,
+          statusEffect,
           attacks: Math.max(1, attacks),
           multi,
           malfunction: malRaw === V6_NO_MALFUNCTION ? null : malRaw,

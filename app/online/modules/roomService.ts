@@ -579,6 +579,24 @@ export const removeRoomNpcEntry = async (entryId: string): Promise<void> => {
   }
 };
 
+// KP 设置/更换/移除 KPC（KP 扮演的 PC 角色）
+// 存储于 room_members.character_id（KP 的成员记录）
+// characterId 传 null 表示移除 KPC
+export const setKpcCharacter = async (roomId: string, userId: string, characterId: string | null): Promise<void> => {
+  const { data, error } = await supabase
+    .from('room_members')
+    .update({ character_id: characterId })
+    .eq('room_id', roomId)
+    .eq('user_id', userId)
+    .eq('role', 'kp')
+    .select('id');
+
+  if (error) throw new Error(error.message);
+  if (!data || data.length === 0) {
+    throw new Error('设置 KPC 失败，请确认你是该房间的 KP');
+  }
+};
+
 // ============================================
 // 密聊小群（private_groups）
 // ============================================
@@ -613,14 +631,17 @@ export const createPrivateGroup = async (input: CreatePrivateGroupInput): Promis
   const memberIds = [...new Set(input.memberUserIds)].filter(Boolean);
   if (memberIds.length === 0) throw new Error('请至少选择一名玩家');
 
-  // 群名：KP 自定义，否则按序号自动命名
+  // 群名：KP 自定义，否则取最小的未被占用序号（避免删除旧群后新群重名）
   let name = (input.name || '').trim();
   if (!name) {
-    const { count } = await supabase
+    const { data: existing } = await supabase
       .from('private_groups')
-      .select('id', { count: 'exact', head: true })
+      .select('name')
       .eq('room_id', input.roomId);
-    name = `密聊 #${(count ?? 0) + 1}`;
+    const used = new Set((existing ?? []).map(r => r.name as string));
+    let n = 1;
+    while (used.has(`密聊 #${n}`)) n++;
+    name = `密聊 #${n}`;
   }
 
   // 前端预生成 id，以 return=minimal 写入：

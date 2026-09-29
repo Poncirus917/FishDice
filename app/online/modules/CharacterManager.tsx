@@ -7,6 +7,7 @@ import AvatarCropper from './AvatarCropper';
 import { encodeShareCode, BG_FIELDS } from './shareCode';
 import { CharacterState, Weapon, WeaponDicePart, Spell } from '../../(single)/page';
 import { supabase } from '../../lib/supabase';
+import { DEFAULT_AVATAR } from '../../lib/constants';
 import { calcDBAndBuild } from '../../utils/attributes';
 
 type SidebarTab = 'create' | 'pc' | 'npc' | 'mob';
@@ -19,10 +20,25 @@ const DEFAULT_FIGHT_WEAPON: Weapon = {
   skill: '斗殴',
   type: 'melee',
   damage: [{ count: 1, sides: 3 }],
+  dbType: 'full',
+  statusEffect: 'none',
   attacks: 1,
   multi: false,
   malfunction: null,
 };
+
+// DB / 状态效果下拉选项
+const DB_OPTIONS = [
+  { value: 'none', label: '无 DB' },
+  { value: 'half', label: '0.5DB' },
+  { value: 'full', label: '1DB' },
+];
+const STATUS_OPTIONS = [
+  { value: 'none', label: '无' },
+  { value: 'burn', label: '燃烧' },
+  { value: 'stun', label: '眩晕' },
+  { value: 'burn_stun', label: '燃烧+眩晕' },
+] as const;
 
 // 武器伤害骰子的可选面数
 const DICE_SIDES_OPTIONS = [3, 4, 6, 8, 10, 12, 20, 100];
@@ -30,11 +46,20 @@ const DICE_SIDES_OPTIONS = [3, 4, 6, 8, 10, 12, 20, 100];
 // 随身物品行数上限
 const POSSESSIONS_LIMIT = 20;
 
-// 格式化武器伤害为展示字符串（近战末尾追加 DB）
+// 格式化武器伤害为展示字符串
 const formatWeaponDamage = (w: Weapon): string => {
-  const parts = w.damage.map(d => `${d.count}D${d.sides}`);
-  if (w.type === 'melee') parts.push('DB');
-  return parts.join('+');
+  // 向后兼容：旧数据未填 dbType 时 melee→full, ranged→none
+  const dbType = w.dbType ?? (w.type === 'melee' ? 'full' : 'none');
+  const parts = w.damage.map(d => d.bonus ? `${d.count}D${d.sides}+${d.bonus}` : `${d.count}D${d.sides}`);
+  if (dbType === 'full') parts.push('DB');
+  else if (dbType === 'half') parts.push('0.5DB');
+  let text = parts.join('+');
+  // 状态效果后缀
+  const se = w.statusEffect ?? 'none';
+  if (se === 'burn') text += ' 🔥';
+  else if (se === 'stun') text += ' 💫';
+  else if (se === 'burn_stun') text += ' 🔥💫';
+  return text;
 };
 
 // 技能模糊匹配输入：只能选择 options 中存在的技能；输入文字后才显示候选（向上展开）
@@ -386,11 +411,7 @@ function CharacterCard({ character, onClick }: { character: CharacterState; onCl
       {/* 顶部：头像 + 姓名 */}
       <div className={`${colors.bg} p-4 flex items-center gap-4 ${character.type === 'mob' ? '' : 'border-b border-slate-700'}`}>
         <div className={`w-16 h-16 rounded-xl ${colors.badge} flex items-center justify-center text-2xl font-bold overflow-hidden border-2 ${colors.border}`}>
-          {character.avatar ? (
-            <img src={character.avatar} alt={character.name} className="w-full h-full object-cover" />
-          ) : (
-            <span className="text-white">{character.name[0]}</span>
-          )}
+          <img src={character.avatar || DEFAULT_AVATAR} alt={character.name} className="w-full h-full object-cover" />
         </div>
         <div className="flex-1">
           <h3 className="font-bold text-lg text-white">{character.name}</h3>
@@ -789,15 +810,15 @@ function CharacterDetailView({
         <div className={`${colors.bg} p-6 flex flex-col md:flex-row gap-6`}>
           {/* 左侧：头像 */}
           <div className="flex flex-col items-center shrink-0">
-            <div 
+            <div
               className={`w-28 h-28 rounded-2xl ${colors.badge} flex items-center justify-center text-5xl font-bold overflow-hidden border-4 ${colors.border} ${isEditing ? 'cursor-pointer hover:opacity-80 transition' : ''}`}
               onClick={() => isEditing && avatarFileRef.current?.click()}
             >
-              {(isEditing ? editAvatar : character.avatar) ? (
-                <img src={isEditing ? editAvatar! : character.avatar!} alt={character.name} className="w-full h-full object-cover" />
-              ) : (
-                <span className="text-white">{character.name[0]}</span>
-              )}
+              <img
+                src={(isEditing ? editAvatar : character.avatar) || DEFAULT_AVATAR}
+                alt={character.name}
+                className="w-full h-full object-cover"
+              />
             </div>
             {isEditing && (
               <>
@@ -1082,7 +1103,7 @@ function CharacterDetailView({
             ? editWeapons
             : (character.weapons?.length ? character.weapons : [DEFAULT_FIGHT_WEAPON]);
           const skillKeys = Object.keys(editTempSkills).filter(k => !allAttrs.includes(k));
-          const tableHeaders = ['武器名称', '使用技能', '类型', '伤害', '次数', '对多', '故障值'];
+          const tableHeaders = ['武器名称', '使用技能', '类型', '伤害', '次数', '状态', '对多', '故障值'];
 
           return (
             <>
@@ -1167,46 +1188,68 @@ function CharacterDetailView({
                           {/* 伤害 */}
                           <td className="px-2 py-2">
                             {isEditing && !isDefault ? (
-                              <div className="flex flex-wrap items-center gap-1">
-                                {w.damage.map((d, di) => (
-                                  <span key={di} className="flex items-center gap-1">
-                                    {di > 0 && <span className="text-slate-500">+</span>}
-                                    <input
-                                      type="number"
-                                      min={1}
-                                      value={d.count}
-                                      onChange={e => updateWeaponDice(wi, di, { count: Math.max(1, parseInt(e.target.value) || 1) })}
-                                      className="w-11 bg-slate-900 border border-slate-700 rounded-lg px-1 py-1 text-xs text-center outline-none focus:border-cyan-500 text-slate-100"
-                                    />
-                                    <span className="text-slate-500">D</span>
-                                    <select
-                                      value={d.sides}
-                                      onChange={e => updateWeaponDice(wi, di, { sides: parseInt(e.target.value) })}
-                                      className="bg-slate-900 border border-slate-700 rounded-lg px-1 py-1 text-xs outline-none focus:border-cyan-500 text-slate-100"
-                                    >
-                                      {DICE_SIDES_OPTIONS.map(s => <option key={s} value={s}>{s}</option>)}
-                                    </select>
-                                    {w.damage.length > 1 && (
-                                      <button
-                                        onClick={() => removeWeaponDice(wi, di)}
-                                        className="text-slate-600 hover:text-red-400"
-                                        title="删除该段骰子"
+                              <div className="flex flex-col gap-1">
+                                {/* 骰子段（最多 3 段，每段可 +固定数值） */}
+                                <div className="flex flex-wrap items-center gap-1">
+                                  {w.damage.map((d, di) => (
+                                    <span key={di} className="flex items-center gap-0.5">
+                                      {di > 0 && <span className="text-slate-500">+</span>}
+                                      <input
+                                        type="number"
+                                        min={1}
+                                        value={d.count}
+                                        onChange={e => updateWeaponDice(wi, di, { count: Math.max(1, parseInt(e.target.value) || 1) })}
+                                        className="w-10 bg-slate-900 border border-slate-700 rounded-lg px-1 py-1 text-xs text-center outline-none focus:border-cyan-500 text-slate-100"
+                                      />
+                                      <span className="text-slate-500">D</span>
+                                      <select
+                                        value={d.sides}
+                                        onChange={e => updateWeaponDice(wi, di, { sides: parseInt(e.target.value) })}
+                                        className="bg-slate-900 border border-slate-700 rounded-lg px-1 py-1 text-xs outline-none focus:border-cyan-500 text-slate-100"
                                       >
-                                        ✕
-                                      </button>
-                                    )}
-                                  </span>
-                                ))}
-                                {w.damage.length < 3 && (
-                                  <button
-                                    onClick={() => addWeaponDice(wi)}
-                                    className="text-cyan-500 hover:text-cyan-300 text-[10px] border border-slate-700 rounded px-1"
-                                    title="追加一段骰子（最多 3 段）"
-                                  >
-                                    +骰
-                                  </button>
-                                )}
-                                {w.type === 'melee' && <span className="text-slate-500">+ <span className="text-cyan-400">DB</span></span>}
+                                        {DICE_SIDES_OPTIONS.map(s => <option key={s} value={s}>{s}</option>)}
+                                      </select>
+                                      {/* 每段可选固定数值 +X */}
+                                      <input
+                                        type="number"
+                                        value={d.bonus ?? ''}
+                                        placeholder="+0"
+                                        onChange={e => {
+                                          if (e.target.value === '') { updateWeaponDice(wi, di, { bonus: undefined }); return; }
+                                          updateWeaponDice(wi, di, { bonus: parseInt(e.target.value) || 0 });
+                                        }}
+                                        className="w-10 bg-slate-900 border border-slate-700 rounded-lg px-1 py-1 text-xs text-center outline-none focus:border-cyan-500 text-amber-400 placeholder-slate-700"
+                                      />
+                                      {w.damage.length > 1 && (
+                                        <button
+                                          onClick={() => removeWeaponDice(wi, di)}
+                                          className="text-slate-600 hover:text-red-400 ml-0.5"
+                                          title="删除该段骰子"
+                                        >
+                                          ✕
+                                        </button>
+                                      )}
+                                    </span>
+                                  ))}
+                                  {w.damage.length < 3 && (
+                                    <button
+                                      onClick={() => addWeaponDice(wi)}
+                                      className="text-cyan-500 hover:text-cyan-300 text-[10px] border border-slate-700 rounded px-1"
+                                      title="追加一段骰子（最多 3 段）"
+                                    >
+                                      +骰
+                                    </button>
+                                  )}
+                                </div>
+                                {/* DB 选择（独立于近战/远程） */}
+                                <select
+                                  value={w.dbType ?? (w.type === 'melee' ? 'full' : 'none')}
+                                  onChange={e => updateWeapon(wi, { dbType: e.target.value as Weapon['dbType'] })}
+                                  className="bg-slate-900 border border-slate-700 rounded-lg px-1 py-1 text-xs outline-none focus:border-cyan-500 text-slate-100 w-24"
+                                  title="伤害加值（DB）类型，近战不一定带 DB、远程也可能带 DB"
+                                >
+                                  {DB_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                                </select>
                               </div>
                             ) : (
                               <span className="font-mono text-cyan-400">{formatWeaponDamage(w)}</span>
@@ -1225,6 +1268,27 @@ function CharacterDetailView({
                               />
                             ) : (
                               <span className="text-slate-300">{w.attacks}</span>
+                            )}
+                          </td>
+
+                          {/* 状态效果 */}
+                          <td className="px-2 py-2">
+                            {isEditing && !isDefault ? (
+                              <select
+                                value={w.statusEffect ?? 'none'}
+                                onChange={e => updateWeapon(wi, { statusEffect: e.target.value as Weapon['statusEffect'] })}
+                                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-1 py-1.5 text-xs outline-none focus:border-cyan-500 text-slate-100"
+                              >
+                                {STATUS_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                              </select>
+                            ) : (
+                              (() => {
+                                const se = w.statusEffect ?? 'none';
+                                if (se === 'burn') return <span className="text-orange-400">🔥</span>;
+                                if (se === 'stun') return <span className="text-cyan-400">💫</span>;
+                                if (se === 'burn_stun') return <span>🔥💫</span>;
+                                return <span className="text-slate-600">无</span>;
+                              })()
                             )}
                           </td>
 
@@ -1289,7 +1353,7 @@ function CharacterDetailView({
               </div>
               {isEditing && (
                 <p className="text-[10px] text-slate-600 mt-1.5">
-                  近战武器的伤害会自动追加伤害加值（DB）；最多 6 把武器，第一把默认武器"肉搏"不可修改或删除。
+                  伤害最多 3 段 XDX，每段可 +固定数值，骰子下方选择 DB（无 / 0.5DB / 1DB，独立于近战/远程）；状态效果可选燃烧 / 眩晕 / 两者同时；默认"肉搏"武器不可修改或删除。
                 </p>
               )}
             </>

@@ -2,6 +2,7 @@
 import Swal from 'sweetalert2';
 import { useState, useEffect } from 'react';
 import { CharacterState } from '../../(single)/page';
+import { DEFAULT_AVATAR } from '../../lib/constants';
 import { cocCheck } from '../../utils/dice';
 
 interface ConsoleViewProps {
@@ -579,7 +580,7 @@ export default function ConsoleView({ characters, setCharacters }: ConsoleViewPr
       <div className={`w-10 h-10 rounded-xl overflow-hidden flex-shrink-0 border-2 ${
         char.type === 'pc' ? 'border-blue-200' : char.type === 'npc' ? 'border-green-200' : 'border-red-200'
       }`}>
-        {char.avatar ? <img src={char.avatar} className="w-full h-full object-cover" alt={char.name} /> : <div className="flex items-center justify-center h-full font-bold text-slate-400 bg-slate-200">{char.name[0]}</div>}
+        {char.avatar ? <img src={char.avatar} className="w-full h-full object-cover" alt={char.name} /> : <img src={DEFAULT_AVATAR} className="w-full h-full object-cover" alt={char.name} />}
       </div>
       <div className="text-left truncate">
         <div className="text-sm font-bold text-slate-800 truncate flex items-center gap-1">

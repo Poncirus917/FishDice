@@ -3,6 +3,7 @@ import Swal from 'sweetalert2';
 import { useState, useRef } from 'react';
 import { parseCharacterText } from '../../utils/parser';
 import { CharacterState } from '../page';
+import { DEFAULT_AVATAR } from '../../lib/constants';
 
 interface ImportViewProps {
   onConfirm: (char: CharacterState) => void;
@@ -385,7 +386,7 @@ export default function ImportView({ onConfirm, characters, setCharacters }: Imp
                       char.type === 'pc' ? 'bg-blue-100 text-blue-600 border-blue-50' : 
                       char.type === 'npc' ? 'bg-emerald-100 text-emerald-600 border-emerald-50' : 'bg-red-100 text-red-600 border-red-50'
                   }`}>
-                    {char.avatar ? <img src={char.avatar} className="w-full h-full object-cover" /> : char.name[0]}
+                    {char.avatar ? <img src={char.avatar} className="w-full h-full object-cover" /> : <img src={DEFAULT_AVATAR} className="w-full h-full object-cover" />}
                   </div>
                   <div>
                     <div className="flex items-center gap-2">

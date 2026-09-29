@@ -5,6 +5,7 @@ import toast from 'react-hot-toast';
 import { useRoom } from './RoomContext';
 import { useConfirmDialog } from './ConfirmDialog';
 import { supabase } from '../../lib/supabase';
+import { DEFAULT_AVATAR } from '../../lib/constants';
 import type { CharacterState } from '../../(single)/page';
 import { rulesFromRoom, CARD_SECTION_OPTIONS } from './roomRules';
 import type { RoomRules } from './roomRules';
@@ -259,11 +260,7 @@ export function JoinRoomModal({ isOpen, roomCode, onClose, onRoomEnter }: JoinRo
             <div className="bg-slate-900/50 rounded-xl p-4 mb-6 border border-slate-700">
               <div className="flex items-center gap-4 mb-3">
                 <div className="w-12 h-12 rounded-full bg-purple-600 flex items-center justify-center text-xl font-bold overflow-hidden">
-                  {roomInfo.creator_avatar ? (
-                    <img src={roomInfo.creator_avatar} alt="" className="w-full h-full object-cover" />
-                  ) : (
-                    <span>{roomInfo.creator_name[0]}</span>
-                  )}
+                  <img src={roomInfo.creator_avatar || DEFAULT_AVATAR} alt="" className="w-full h-full object-cover" />
                 </div>
                 <div>
                   <div className="text-sm text-slate-500">房间创建者</div>
@@ -360,11 +357,7 @@ export function JoinRoomModal({ isOpen, roomCode, onClose, onRoomEnter }: JoinRo
                       >
                         <div className="flex items-center gap-3">
                           <div className="w-10 h-10 rounded-lg bg-cyan-700 flex items-center justify-center text-base font-bold overflow-hidden">
-                            {char.avatar ? (
-                              <img src={char.avatar} alt="" className="w-full h-full object-cover" />
-                            ) : (
-                              <span>{char.name[0]}</span>
-                            )}
+                            <img src={char.avatar || DEFAULT_AVATAR} alt="" className="w-full h-full object-cover" />
                           </div>
                           <div className="flex-1">
                             <div className="font-bold text-white text-sm">{char.name}</div>

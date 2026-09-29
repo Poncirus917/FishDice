@@ -3,6 +3,7 @@ import { useState, useEffect, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import toast from 'react-hot-toast';
 import { supabase } from '../lib/supabase';
+import { DEFAULT_AVATAR } from '../lib/constants';
 import CharacterManager from './modules/CharacterManager';
 import AvatarCropper from './modules/AvatarCropper';
 import { RoomProvider, useRoom } from './modules/RoomContext';
@@ -65,7 +66,7 @@ function OnlinePageContent() {
       if (profile) {
         const name = profile.display_name || session.user.email || '调查员';
         setDisplayName(name);
-        setAvatarUrl(profile.avatar_url || '');
+        setAvatarUrl(profile.avatar_url || DEFAULT_AVATAR);
         localStorage.setItem('fish_display_name', name);
       } else {
         const name = session.user.email || '调查员';
@@ -292,11 +293,7 @@ function OnlinePageContent() {
       {avatarUrl ? (
         <img src={`${avatarUrl}${avatarUrl.includes('?') ? '&' : '?'}v=${avatarCacheKey}`} alt="头像" className="w-7 h-7 rounded-full object-cover" />
       ) : (
-        <div className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold ${
-          dark ? 'bg-slate-700 text-cyan-400' : 'bg-slate-200 text-slate-500'
-        }`}>
-          {displayName?.[0] || '?'}
-        </div>
+        <img src={DEFAULT_AVATAR} alt="头像" className="w-7 h-7 rounded-full object-cover" />
       )}
       <span className={`text-sm ${dark ? 'text-slate-300' : 'text-slate-600'}`}>{displayName}</span>
     </button>
@@ -443,6 +440,7 @@ function OnlinePageContent() {
           isOpen={showCreateModal}
           onClose={() => setShowCreateModal(false)}
           onRoomCreated={() => handleEnterRoom()}
+          userId={userId!}
         />
 
         <JoinRoomModal

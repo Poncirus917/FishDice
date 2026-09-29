@@ -17,12 +17,12 @@ CREATE TABLE IF NOT EXISTS profiles (
 ALTER TABLE profiles DROP CONSTRAINT IF EXISTS unique_display_name;
 ALTER TABLE profiles ADD CONSTRAINT unique_display_name UNIQUE (display_name);
 
--- 2. 注册时自动创建 profile 行（从 user_metadata 取 display_name，email 从 auth.users 同步）
+-- 2. 注册时自动创建 profile 行（从 user_metadata 取 display_name，email 从 auth.users 同步；默认头像）
 CREATE OR REPLACE FUNCTION public.handle_new_user()
 RETURNS TRIGGER AS $$
 BEGIN
-  INSERT INTO public.profiles (id, email, display_name)
-  VALUES (NEW.id, NEW.email, NEW.raw_user_meta_data->>'display_name')
+  INSERT INTO public.profiles (id, email, display_name, avatar_url)
+  VALUES (NEW.id, NEW.email, NEW.raw_user_meta_data->>'display_name', '/default-avatar.png')
   ON CONFLICT (id) DO NOTHING;
   RETURN NEW;
 END;
@@ -115,12 +115,12 @@ FROM auth.users
 WHERE profiles.id = auth.users.id
   AND profiles.email IS NULL;
 
--- 更新触发器（保存 email）
+-- 更新触发器（保存 email；注册默认头像为鱼骰默认头像）
 CREATE OR REPLACE FUNCTION public.handle_new_user()
 RETURNS TRIGGER AS $$
 BEGIN
-  INSERT INTO public.profiles (id, email, display_name)
-  VALUES (NEW.id, NEW.email, NEW.raw_user_meta_data->>'display_name')
+  INSERT INTO public.profiles (id, email, display_name, avatar_url)
+  VALUES (NEW.id, NEW.email, NEW.raw_user_meta_data->>'display_name', '/default-avatar.png')
   ON CONFLICT (id) DO NOTHING;
   RETURN NEW;
 END;
@@ -444,12 +444,12 @@ CREATE POLICY "Author or KP can update dice logs" ON dice_logs
   FOR UPDATE TO authenticated
   USING (user_id = auth.uid() OR public.is_room_creator(room_id, auth.uid()));
 
--- 删除：作者本人或 KP（为后续"删除单条日志"预留）；房间发言任何人不可删除
+-- 删除：作者本人或 KP（为后续"删除单条日志"预留）；房间发言与密聊记录任何人都不可删除
 DROP POLICY IF EXISTS "Author or KP can delete dice logs" ON dice_logs;
 CREATE POLICY "Author or KP can delete dice logs" ON dice_logs
   FOR DELETE TO authenticated
   USING (
-    msg_type <> 'speech'
+    msg_type NOT IN ('speech', 'whisper')
     AND (user_id = auth.uid() OR public.is_room_creator(room_id, auth.uid()))
   );
 
@@ -630,12 +630,12 @@ ALTER TABLE public.dice_logs DROP CONSTRAINT IF EXISTS dice_logs_msg_type_check;
 ALTER TABLE public.dice_logs ADD CONSTRAINT dice_logs_msg_type_check
   CHECK (msg_type IN ('check', 'custom', 'damage', 'hidden', 'request', 'note', 'status', 'speech', 'whisper'));
 
--- 房间发言任何人（含作者本人与 KP）都不可删除：重建 DELETE 策略
+-- 房间发言与密聊记录任何人（含作者本人与 KP）都不可删除：重建 DELETE 策略
 DROP POLICY IF EXISTS "Author or KP can delete dice logs" ON public.dice_logs;
 CREATE POLICY "Author or KP can delete dice logs" ON public.dice_logs
   FOR DELETE TO authenticated
   USING (
-    msg_type <> 'speech'
+    msg_type NOT IN ('speech', 'whisper')
     AND (user_id = auth.uid() OR public.is_room_creator(room_id, auth.uid()))
   );
 

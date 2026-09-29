@@ -1,6 +1,7 @@
 "use client";
 import { useEffect } from 'react';
 import type { CharacterState } from '../../(single)/page';
+import { DEFAULT_AVATAR } from '../../lib/constants';
 import { calcDBAndBuild } from '../../utils/attributes';
 import { BG_FIELDS } from './shareCode';
 import type { CardSection, CardSectionsState } from './roomRules';
@@ -95,8 +96,17 @@ export default function CharacterCardModal({
     { label: 'LUCK', cur: character.luck?.current || 0, max: character.luck?.max || 99, text: 'text-amber-400', bar: 'bg-amber-500' },
   ];
 
-  const formatDamage = (w: NonNullable<CharacterState['weapons']>[number]) =>
-    [...w.damage.map(d => `${d.count}D${d.sides}`), ...(w.type === 'melee' ? ['DB'] : [])].join('+');
+  const formatDamage = (w: NonNullable<CharacterState['weapons']>[number]) => {
+    const dbType = w.dbType ?? (w.type === 'melee' ? 'full' : 'none');
+    const parts = w.damage.map(d => d.bonus ? `${d.count}D${d.sides}+${d.bonus}` : `${d.count}D${d.sides}`);
+    if (dbType === 'full') parts.push('DB');
+    else if (dbType === 'half') parts.push('0.5DB');
+    const se = w.statusEffect ?? 'none';
+    if (se === 'burn') parts.push('🔥');
+    else if (se === 'stun') parts.push('💫');
+    else if (se === 'burn_stun') parts.push('🔥💫');
+    return parts.join('+');
+  };
 
   return (
     <div
@@ -118,11 +128,7 @@ export default function CharacterCardModal({
           <div className={`${colors.bg} p-6 flex flex-col md:flex-row gap-6`}>
             <div className="flex flex-col items-center shrink-0">
               <div className={`w-24 h-24 rounded-2xl ${colors.badge} flex items-center justify-center text-4xl font-bold overflow-hidden border-4 ${colors.border}`}>
-                {character.avatar ? (
-                  <img src={character.avatar} alt={character.name} className="w-full h-full object-cover" />
-                ) : (
-                  <span className="text-white">{character.name[0]}</span>
-                )}
+                <img src={character.avatar || DEFAULT_AVATAR} alt={character.name} className="w-full h-full object-cover" />
               </div>
               <div className={`mt-3 px-3 py-1 rounded-lg ${colors.badge} text-white text-xs font-bold`}>
                 {character.type === 'mob' ? '怪物' : character.type === 'npc' ? 'NPC' : 'PC'}

@@ -9,7 +9,6 @@ import {
   createPrivateGroup,
   deletePrivateGroup,
   setGroupCanSpeak,
-  sendPrivateMessage,
 } from './roomService';
 
 const PRIVATE_GROUPS_EVENT = 'private_groups_changed';
@@ -74,14 +73,17 @@ interface PrivateChatPanelProps {
   roomId: string;
   userId: string;
   isCreator: boolean;
-  senderName: string;
-  // 房间成员（带 profile），用于 KP 建群选择 PL、展示群成员名
+  // 房间成员（带 profile 与角色名），用于 KP 建群选择 PL、展示群成员名
   members: Array<{
     user_id: string;
     role: 'kp' | 'pl';
+    character_name?: string | null;
     profile?: { display_name: string; avatar_url: string | null };
   }>;
   groups: PrivateGroupWithMembers[];
+  // 当前选中的密聊群（null = 公屏）
+  selectedGroupId: string | null;
+  onSelectGroup: (groupId: string | null) => void;
   notifyChanged: () => Promise<void>;
   onClose: () => void;
 }
@@ -90,14 +92,13 @@ export default function PrivateChatPanel({
   roomId,
   userId,
   isCreator,
-  senderName,
   members,
   groups,
+  selectedGroupId,
+  onSelectGroup,
   notifyChanged,
   onClose,
 }: PrivateChatPanelProps) {
-  const [selectedGroupId, setSelectedGroupId] = useState<string | null>(groups[0]?.id ?? null);
-  const [text, setText] = useState('');
   const [busy, setBusy] = useState(false);
 
   // KP 建群表单
@@ -107,44 +108,11 @@ export default function PrivateChatPanel({
 
   // 可选 PL（排除 KP）
   const plMembers = members.filter(m => m.role !== 'kp');
-  const nameOf = (uid: string) =>
-    members.find(m => m.user_id === uid)?.profile?.display_name || '未知玩家';
-
-  const selectedGroup = groups.find(g => g.id === selectedGroupId) ?? null;
-  // PL 是否被允许在当前群发言
-  const myMembership = selectedGroup?.members.find(m => m.user_id === userId) ?? null;
-  const canISpeak = isCreator || myMembership?.can_speak === true;
-
-  // 发送密聊消息
-  const handleSend = async () => {
-    if (!selectedGroup) {
-      toast('请先选择一个密聊群');
-      return;
-    }
-    if (!isCreator && !myMembership) {
-      toast.error('你不在该密聊群中');
-      return;
-    }
-    if (!canISpeak) {
-      toast.error('本群当前已被 KP 禁止发言');
-      return;
-    }
-    setBusy(true);
-    try {
-      await sendPrivateMessage({
-        roomId,
-        groupId: selectedGroup.id,
-        groupName: selectedGroup.name,
-        senderUserId: userId,
-        senderName,
-        text,
-      });
-      setText('');
-    } catch (err: any) {
-      toast.error(err.message || '发送失败');
-    } finally {
-      setBusy(false);
-    }
+  // 成员显示：PC名（PL名），无角色卡时仅 PL 名
+  const labelOf = (uid: string) => {
+    const m = members.find(x => x.user_id === uid);
+    const pl = m?.profile?.display_name || '未知玩家';
+    return m?.character_name ? `${m.character_name}（${pl}）` : pl;
   };
 
   // KP：勾选 / 取消 PL
@@ -175,7 +143,7 @@ export default function PrivateChatPanel({
       setCreating(false);
       setNewName('');
       setPicked(new Set());
-      setSelectedGroupId(group.id);
+      onSelectGroup(group.id);
       toast.success('密聊群已创建');
     } catch (err: any) {
       toast.error(err.message || '创建失败');
@@ -213,7 +181,7 @@ export default function PrivateChatPanel({
       try {
         await deletePrivateGroup(group.id);
         await notifyChanged();
-        if (selectedGroupId === group.id) setSelectedGroupId(null);
+        if (selectedGroupId === group.id) onSelectGroup(null);
       } catch (err: any) {
         toast.error(err.message || '操作失败');
       }
@@ -221,11 +189,11 @@ export default function PrivateChatPanel({
   };
 
   return (
-    <div className="popup-slide-right fixed left-[calc(21rem+3.5rem)] bottom-[calc(33vh+1.5rem)] z-[60] w-80 bg-slate-800/95 border border-red-950 rounded-2xl shadow-2xl shadow-black/50 backdrop-blur">
+    <div className="absolute bottom-full left-0 mb-2 z-50 w-72 bg-slate-800/95 border border-red-950 rounded-2xl shadow-2xl shadow-black/50 backdrop-blur">
       {/* 头部 */}
       <div className="px-4 py-3 border-b border-slate-700/80 flex items-center gap-2">
         <span>🤫</span>
-        <span className="font-bold text-sm text-red-200">密聊</span>
+        <span className="font-bold text-sm text-red-200">选择频道</span>
         <button
           onClick={onClose}
           className="ml-auto w-6 h-6 rounded-md text-slate-400 hover:text-white hover:bg-slate-700 transition text-sm leading-none"
@@ -234,10 +202,27 @@ export default function PrivateChatPanel({
         </button>
       </div>
 
-      {/* 群列表（选择当前发言群） */}
-      <div className="p-2 max-h-52 overflow-y-auto space-y-1">
+      {/* 频道列表：公屏 + 各密聊群 */}
+      <div className="p-2 max-h-60 overflow-y-auto space-y-1">
+        {/* 公屏 */}
+        <div
+          onClick={() => onSelectGroup(null)}
+          className={`px-2.5 py-2 rounded-lg cursor-pointer border transition ${
+            selectedGroupId === null
+              ? 'bg-blue-950/60 border-blue-800/80'
+              : 'bg-slate-900/50 border-transparent hover:border-slate-700'
+          }`}
+        >
+          <div className="flex items-center gap-2">
+            <span
+              className={`w-2 h-2 rounded-full flex-shrink-0 ${selectedGroupId === null ? 'bg-blue-400' : 'bg-slate-600'}`}
+            />
+            <span className="text-xs font-bold text-blue-100/90">💬 公屏（全体可见）</span>
+          </div>
+        </div>
+
         {groups.length === 0 && (
-          <p className="text-center text-slate-500 text-[11px] py-4 italic">
+          <p className="text-center text-slate-500 text-[11px] py-3 italic">
             {isCreator ? '还没有密聊群，点击下方按钮创建' : '暂无密聊群'}
           </p>
         )}
@@ -245,15 +230,16 @@ export default function PrivateChatPanel({
         {groups.map(g => {
           const active = g.id === selectedGroupId;
           const allowed = g.members.some(m => m.can_speak);
+          const imIn = isCreator || g.members.some(m => m.user_id === userId);
           return (
             <div
               key={g.id}
-              onClick={() => setSelectedGroupId(g.id)}
+              onClick={() => { onSelectGroup(g.id); onClose(); }}
               className={`px-2.5 py-2 rounded-lg cursor-pointer border transition ${
                 active
                   ? 'bg-red-950/60 border-red-800/80'
                   : 'bg-slate-900/50 border-transparent hover:border-slate-700'
-              }`}
+              } ${!imIn ? 'opacity-50' : ''}`}
             >
               <div className="flex items-center gap-2">
                 <span
@@ -261,6 +247,7 @@ export default function PrivateChatPanel({
                 />
                 <span className="text-xs font-bold text-red-100/90 truncate">{g.name}</span>
                 <span className="text-[9px] text-slate-500 flex-shrink-0">{g.members.length}人</span>
+                {!allowed && <span title="已禁言" className="text-[10px] flex-shrink-0">🔇</span>}
 
                 {isCreator && (
                   <div className="ml-auto flex items-center gap-1 flex-shrink-0">
@@ -287,7 +274,7 @@ export default function PrivateChatPanel({
               </div>
               {/* 群成员小字 */}
               <div className="mt-1 pl-4 text-[9px] text-slate-500 truncate">
-                {g.members.map(m => nameOf(m.user_id)).join('、')}
+                {g.members.map(m => labelOf(m.user_id)).join('、')}
               </div>
             </div>
           );
@@ -319,7 +306,7 @@ export default function PrivateChatPanel({
                 className="flex items-center gap-2 px-1.5 py-1 rounded hover:bg-slate-800 cursor-pointer"
               >
                 <span
-                  className={`w-3.5 h-3.5 rounded border flex items-center justify-center text-[9px] ${
+                  className={`w-3.5 h-3.5 rounded border flex items-center justify-center text-[9px] flex-shrink-0 ${
                     picked.has(m.user_id)
                       ? 'bg-red-700 border-red-600 text-white'
                       : 'bg-slate-800 border-slate-600 text-transparent'
@@ -333,8 +320,8 @@ export default function PrivateChatPanel({
                   onChange={() => togglePicked(m.user_id)}
                   className="sr-only"
                 />
-                <span className="text-[11px] text-slate-300">
-                  {m.profile?.display_name || '未知玩家'}
+                <span className="text-[11px] text-slate-300 truncate">
+                  {labelOf(m.user_id)}
                 </span>
               </label>
             ))}
@@ -360,34 +347,6 @@ export default function PrivateChatPanel({
           </div>
         </div>
       )}
-
-      {/* 底部：消息输入（PL 被禁言时锁定） */}
-      <div className="p-2 border-t border-slate-700/80">
-        {selectedGroup && !canISpeak && !isCreator && (
-          <p className="text-[10px] text-red-400/90 text-center py-1">🔇 KP 已禁止本群发言</p>
-        )}
-        <div className="flex gap-1.5">
-          <input
-            value={text}
-            onChange={e => setText(e.target.value)}
-            onKeyDown={e => { if (e.key === 'Enter') handleSend(); }}
-            disabled={busy || (!isCreator && (!selectedGroup || !canISpeak))}
-            placeholder={
-              selectedGroup
-                ? `在「${selectedGroup.name}」中发言…`
-                : '请先选择一个密聊群'
-            }
-            className="flex-1 min-w-0 px-2.5 py-2 bg-slate-900 border border-slate-700 rounded-lg text-[11px] text-white outline-none focus:border-red-700 disabled:opacity-50 placeholder:text-slate-600"
-          />
-          <button
-            onClick={handleSend}
-            disabled={busy || (!isCreator && (!selectedGroup || !canISpeak))}
-            className="px-3 py-2 bg-red-900 hover:bg-red-800 rounded-lg text-[11px] font-bold text-red-100 transition disabled:opacity-50"
-          >
-            发送
-          </button>
-        </div>
-      </div>
     </div>
   );
 }

@@ -6,12 +6,14 @@ import { useRoom } from './RoomContext';
 import { useConfirmDialog } from './ConfirmDialog';
 import NpcImportModal from './NpcImportModal';
 import CharacterCardModal from './CharacterCardModal';
+import KpcImportModal from './KpcImportModal';
 import PrivateChatPanel, { usePrivateGroups } from './PrivateChatPanel';
 import { supabase } from '../../lib/supabase';
+import { DEFAULT_AVATAR } from '../../lib/constants';
 import type { DiceGroup } from '../../utils/dice';
 import type { CharacterState } from '../../(single)/page';
 import type { RoomNpcEntry, DiceLog } from './roomTypes';
-import { getRoomNpcEntries, setRoomNpcVisible, removeRoomNpcEntry, deleteDiceLog, insertDiceLog, revealCardSection } from './roomService';
+import { getRoomNpcEntries, setRoomNpcVisible, removeRoomNpcEntry, deleteDiceLog, insertDiceLog, revealCardSection, setKpcCharacter, sendPrivateMessage } from './roomService';
 import { rulesFromRoom, sectionsForViewer, revealedFromMember, CARD_SECTION_OPTIONS } from './roomRules';
 import type { CardSection } from './roomRules';
 
@@ -58,23 +60,22 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
   const [freeBonus, setFreeBonus] = useState<number>(0);
   const logListRef = useRef<HTMLDivElement>(null);
 
-  // 掷骰记录悬浮侧栏（常态隐藏，右缘 LOGS 按钮展开）
-  const [logsOpen, setLogsOpen] = useState(false);
-  // 面板默认半透明（可透视页面），点击面板内部后转为不透明
-  const [logsTouched, setLogsTouched] = useState(false);
-  // 私有笔记弹窗（笔记仅自己可见）
-  const [noteModalOpen, setNoteModalOpen] = useState(false);
-  const [noteText, setNoteText] = useState('');
-  const [noteBusy, setNoteBusy] = useState(false);
+  // 右侧历史记录面板（常态显示）+ 底部输入区
+  const [inputText, setInputText] = useState('');
+  const [inputBusy, setInputBusy] = useState(false);
+  // 笔记模式：输入框内容作为私有笔记发送（仅自己可见），发送后自动退出笔记模式
+  const [noteMode, setNoteMode] = useState(false);
+  // 当前频道：'public' = 公屏；其他值 = 密聊群 id
+  const [channel, setChannel] = useState<'public' | string>('public');
+  // 频道选择弹窗（含 KP 建群 / 禁言 / 解散管理）
+  const [channelMenuOpen, setChannelMenuOpen] = useState(false);
 
-  // 发言弹窗（发言对全房间可见）
-  const [speechModalOpen, setSpeechModalOpen] = useState(false);
-  const [speechText, setSpeechText] = useState('');
-  const [speechBusy, setSpeechBusy] = useState(false);
-
-  // LOGS 显示内容过滤：发言 / 掷骰 / 笔记（默认全选；偏好存 localStorage）
-  const [logFilter, setLogFilter] = useState<{ speech: boolean; dice: boolean; note: boolean }>(() => {
-    if (typeof window === 'undefined') return { speech: true, dice: true, note: true };
+  // LOGS 显示内容过滤：发言 / 掷骰 / 笔记 + 各密聊群（含已解散群，默认全选；偏好存 localStorage）
+  const [logFilter, setLogFilter] = useState<{
+    speech: boolean; dice: boolean; note: boolean;
+    whisperGroups: Record<string, boolean>;
+  }>(() => {
+    if (typeof window === 'undefined') return { speech: true, dice: true, note: true, whisperGroups: {} };
     try {
       const saved = JSON.parse(localStorage.getItem('fish_log_filter') || 'null');
       if (saved && typeof saved === 'object') {
@@ -82,17 +83,27 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
           speech: saved.speech !== false,
           dice: saved.dice !== false,
           note: saved.note !== false,
+          whisperGroups: saved.whisperGroups && typeof saved.whisperGroups === 'object' ? saved.whisperGroups : {},
         };
       }
     } catch { /* 忽略损坏的偏好 */ }
-    return { speech: true, dice: true, note: true };
+    return { speech: true, dice: true, note: true, whisperGroups: {} };
   });
   // LOGS 显示内容设置小弹窗
   const [logFilterOpen, setLogFilterOpen] = useState(false);
-  // 密聊面板（小弹窗）
-  const [privatePanelOpen, setPrivatePanelOpen] = useState(false);
+  // KP 发言/密聊时选择的角色名（null = 守秘人）
+  const [kpSelectedCharName, setKpSelectedCharName] = useState<string | null>(null);
+  // KPC 导入弹窗
+  const [kpcImportOpen, setKpcImportOpen] = useState(false);
   // 密聊群（KP 全部可见；PL 仅自己所属群；实时同步）
   const { groups: privateGroups, notifyChanged: notifyPrivateChanged } = usePrivateGroups(currentRoom?.id ?? '');
+
+  // 当前密聊频道被解散时自动回退到公屏
+  useEffect(() => {
+    if (channel !== 'public' && !privateGroups.some(g => g.id === channel)) {
+      setChannel('public');
+    }
+  }, [privateGroups, channel]);
 
   // 调试日志
   useEffect(() => {
@@ -180,11 +191,11 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
     }
   }, [myMembership]);
 
-  // 新日志到达时自动滚动到底部（像聊天软件一样跟随最新消息）；打开侧栏时也滚到底
+  // 新日志到达时自动滚动到底部（像聊天软件一样跟随最新消息）
   useEffect(() => {
     const el = logListRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [diceLogs, logsOpen]);
+  }, [diceLogs]);
 
   // KP：切换剧本角色在场/不在场（行离开 PL 的 RLS 可见集合时 postgres_changes 可能丢事件，用广播兜底）
   const handleToggleNpcVisible = async (entry: RoomNpcEntry) => {
@@ -213,6 +224,38 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
       toast.success('已从房间移除');
     } catch (err: any) {
       toast.error(err.message || '移除失败');
+    } finally {
+      setNpcOpBusy(false);
+    }
+  };
+
+  // KP：移除 KPC（清空 room_members.character_id）
+  const handleRemoveKpc = async () => {
+    if (!currentRoom) return;
+    setNpcOpBusy(true);
+    try {
+      await setKpcCharacter(currentRoom.id, userId, null);
+      // 触发重新加载房间数据以刷新成员列表
+      await loadRoom(currentRoom.id);
+      toast.success('KPC 已移除');
+    } catch (err: any) {
+      toast.error(err.message || '移除 KPC 失败');
+    } finally {
+      setNpcOpBusy(false);
+    }
+  };
+
+  // KP：导入/更换 KPC
+  const handleImportKpc = async (characterId: string) => {
+    if (!currentRoom) return;
+    setNpcOpBusy(true);
+    try {
+      await setKpcCharacter(currentRoom.id, userId, characterId);
+      await loadRoom(currentRoom.id);
+      toast.success('KPC 已设置');
+      setKpcImportOpen(false);
+    } catch (err: any) {
+      toast.error(err.message || '设置 KPC 失败');
     } finally {
       setNpcOpBusy(false);
     }
@@ -260,6 +303,33 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
     })
     .filter((x): x is { entryId: string; character: CharacterState; display: string } => x !== null);
   const kpCanCheck = npcOptions.length > 0;
+
+  // KP 发言/密聊时的角色选项：守秘人 / KPC / NPC / 怪物
+  const kpCharOptions: Array<{ name: string | null; label: string }> = [
+    { name: null, label: '守秘人' },
+    ...(() => {
+      const opts: Array<{ name: string | null; label: string }> = [];
+      // KPC（KP 的 PC 角色）
+      const kpc = myCharacterId ? allCharacters[myCharacterId] : null;
+      if (kpc && isCreator) {
+        opts.push({ name: kpc.name, label: `KPC·${kpc.name}` });
+      }
+      // NPC / 怪物（在场或全部，KP 可见全部）
+      npcOptions.forEach(o => {
+        const prefix = o.character.type === 'mob' ? '怪物·' : 'NPC·';
+        opts.push({ name: o.display, label: `${prefix}${o.display}` });
+      });
+      return opts;
+    })(),
+  ];
+
+  // KP 当前所选代言角色对象（null = 守秘人身份）：用于发言/密聊时写入 character_id，弹窗可显示对应头像
+  const kpSelectedChar = (() => {
+    if (!isCreator || !kpSelectedCharName) return null;
+    const kpc = myCharacterId ? allCharacters[myCharacterId] : null;
+    if (kpc && kpc.name === kpSelectedCharName) return kpc;
+    return npcOptions.find(o => o.display === kpSelectedCharName)?.character ?? null;
+  })();
 
   // KP 没有可代掷角色时自动切到自由掷骰页签（检定行为必须绑定角色）
   useEffect(() => {
@@ -319,7 +389,7 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
 
     try {
       if (isCreator) {
-        await performCustomRoll({ label: freeLabel, groups: validGroups, bonus: freeBonus, charName: '守秘人' });
+        await performCustomRoll({ label: freeLabel, groups: validGroups, bonus: freeBonus, charName: kpSelectedCharName || '守秘人' });
       } else {
         const myChar = myCharacterId ? allCharacters[myCharacterId] : null;
         await performCustomRoll({
@@ -370,8 +440,29 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
   const getLogCategory = (t: DiceLog['msg_type']): 'speech' | 'dice' | 'note' =>
     t === 'note' ? 'note' : (t === 'speech' || t === 'whisper') ? 'speech' : 'dice';
 
-  // LOGS 面板当前实际展示的日志（受设置弹窗的复选框控制）
-  const visibleDiceLogs = diceLogs.filter(l => logFilter[getLogCategory(l.msg_type)]);
+  // 历史记录面板当前实际展示的日志（受设置弹窗的复选框控制）：
+  // 密聊消息额外按群过滤（含已解散群，群列表从历史日志中提取）
+  const visibleDiceLogs = diceLogs.filter(l => {
+    if (l.msg_type === 'whisper') {
+      if (!logFilter.speech) return false;
+      const gid = (l.payload?.group_id as string | undefined) ?? '';
+      return logFilter.whisperGroups[gid] !== false;
+    }
+    return logFilter[getLogCategory(l.msg_type)];
+  });
+
+  // 历史日志中出现过的密聊群（含已解散群：解散后 whisper 消息仍保留）
+  const whisperGroupList = (() => {
+    const map = new Map<string, string>();
+    diceLogs.forEach(l => {
+      if (l.msg_type !== 'whisper') return;
+      const gid = l.payload?.group_id as string | undefined;
+      if (gid && !map.has(gid)) {
+        map.set(gid, (l.payload?.group_name as string | undefined) || l.label || '未命名群');
+      }
+    });
+    return [...map.entries()].map(([id, name]) => ({ id, name }));
+  })();
 
   // 切换某分类显示并持久化偏好
   const toggleLogFilter = (key: 'speech' | 'dice' | 'note') => {
@@ -382,7 +473,19 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
     });
   };
 
-  // 掷骰结果悬浮提示队列：新骰子从底部入队、先出现的被顶上去，6 秒后自动消失
+  // 切换某个密聊群（含已解散）的显示并持久化偏好
+  const toggleWhisperGroupFilter = (gid: string) => {
+    setLogFilter(prev => {
+      const next = {
+        ...prev,
+        whisperGroups: { ...prev.whisperGroups, [gid]: prev.whisperGroups[gid] === false },
+      };
+      try { localStorage.setItem('fish_log_filter', JSON.stringify(next)); } catch { /* 忽略 */ }
+      return next;
+    });
+  };
+
+  // 掷骰结果悬浮提示队列：新骰子从底部入队、先出现的被顶上去，10 秒后自动消失
   const [rollToasts, setRollToasts] = useState<DiceLog[]>([]);
   // 已弹过提示的日志 id（防止重复弹出）
   const seenToastIdsRef = useRef<Set<string>>(new Set());
@@ -400,12 +503,13 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
     fresh.forEach(l => seenToastIdsRef.current.add(l.id));
     setRollToasts(prev => {
       const merged = [...prev, ...fresh];
-      return merged.length > 5 ? merged.slice(merged.length - 5) : merged;
+      // 弹窗卡片较大（含头像），最多同时堆叠 3 条
+      return merged.length > 3 ? merged.slice(merged.length - 3) : merged;
     });
     fresh.forEach(l => {
       setTimeout(() => {
         setRollToasts(prev => prev.filter(t => t.id !== l.id));
-      }, 6000);
+      }, 10000);
     });
   }, [diceLogs]);
 
@@ -438,62 +542,79 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
     });
   };
 
-  // 保存私有笔记（msg_type='note'，RLS 保证仅作者本人可读，其他人不可见）
-  const handleSaveNote = async () => {
+  // 统一发送：按 笔记模式 / 公屏 / 密聊频道 分发（输入框共用，Enter 发送）
+  const handleSendInput = async () => {
     if (!currentRoom) return;
-    const text = noteText.trim();
-    if (!text) {
-      toast('请输入笔记内容');
-      return;
-    }
-    setNoteBusy(true);
+    const text = inputText.trim();
+    if (!text) return;
+    setInputBusy(true);
     try {
       const myChar = myCharacterId ? allCharacters[myCharacterId] : null;
-      await insertDiceLog({
-        room_id: currentRoom.id,
-        user_id: userId,
-        character_id: myCharacterId ?? null,
-        char_name: isCreator ? '守秘人' : (myChar?.name || displayName),
-        msg_type: 'note',
-        label: '记录',
-        level: text,
-      });
-      toast.success('笔记已保存（仅自己可见）');
-      setNoteModalOpen(false);
-      setNoteText('');
-    } catch (err: any) {
-      toast.error(err.message || '保存失败');
-    } finally {
-      setNoteBusy(false);
-    }
-  };
 
-  // 保存发言（msg_type='speech'，房间全体成员可读，随 Realtime 实时同步）
-  const handleSaveSpeech = async () => {
-    if (!currentRoom) return;
-    const text = speechText.trim();
-    if (!text) {
-      toast('请输入发言内容');
-      return;
-    }
-    setSpeechBusy(true);
-    try {
-      const myChar = myCharacterId ? allCharacters[myCharacterId] : null;
-      await insertDiceLog({
-        room_id: currentRoom.id,
-        user_id: userId,
-        character_id: isCreator ? null : myCharacterId,
-        char_name: isCreator ? '守秘人' : (myChar?.name || displayName),
-        msg_type: 'speech',
-        label: '发言',
-        level: text,
+      if (noteMode) {
+        // 笔记：msg_type='note'，RLS 保证仅作者本人可读
+        await insertDiceLog({
+          room_id: currentRoom.id,
+          user_id: userId,
+          character_id: myCharacterId ?? null,
+          char_name: isCreator ? '守秘人' : (myChar?.name || displayName),
+          msg_type: 'note',
+          label: '记录',
+          level: text,
+        });
+        setNoteMode(false);
+        setInputText('');
+        toast.success('笔记已保存（仅自己可见）');
+        return;
+      }
+
+      if (channel === 'public') {
+        // 公屏发言：房间全体成员可读（KP 带所选角色 id，供弹窗头像显示）
+        await insertDiceLog({
+          room_id: currentRoom.id,
+          user_id: userId,
+          character_id: isCreator ? (kpSelectedChar?.id ?? null) : myCharacterId,
+          char_name: isCreator ? (kpSelectedCharName || '守秘人') : (myChar?.name || displayName),
+          msg_type: 'speech',
+          label: '发言',
+          level: text,
+        });
+        setInputText('');
+        return;
+      }
+
+      // 密聊频道：写入 whisper（KP 或群内可发言成员）
+      const group = privateGroups.find(g => g.id === channel);
+      if (!group) {
+        toast('该密聊群不存在或已解散');
+        setChannel('public');
+        return;
+      }
+      if (!isCreator) {
+        const mem = group.members.find(m => m.user_id === userId);
+        if (!mem) {
+          toast.error('你不在该密聊群中');
+          return;
+        }
+        if (!mem.can_speak) {
+          toast.error('本群当前已被 KP 禁止发言');
+          return;
+        }
+      }
+      await sendPrivateMessage({
+        roomId: currentRoom.id,
+        groupId: group.id,
+        groupName: group.name,
+        senderUserId: userId,
+        senderName: isCreator ? (kpSelectedCharName || '守秘人') : (myChar?.name || displayName),
+        characterId: isCreator ? (kpSelectedChar?.id ?? null) : myCharacterId,
+        text,
       });
-      setSpeechModalOpen(false);
-      setSpeechText('');
+      setInputText('');
     } catch (err: any) {
       toast.error(err.message || '发送失败');
     } finally {
-      setSpeechBusy(false);
+      setInputBusy(false);
     }
   };
 
@@ -508,9 +629,9 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
 
     const content = visibleDiceLogs.map(log => {
       const sender = currentRoom.members.find(m => m.user_id === log.user_id);
-      const name = (isCreator && log.user_id === currentRoom.creator_id)
-        ? '守秘人'
-        : (log.char_name || sender?.profile?.display_name || '未知');
+      const name = (log.char_name && log.char_name !== '守秘人')
+        ? log.char_name
+        : (log.user_id === currentRoom.creator_id ? '守秘人' : (log.char_name || sender?.profile?.display_name || '未知'));
       const time = formatLogTime(log.created_at);
 
       if (log.msg_type === 'whisper') {
@@ -543,25 +664,141 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
     URL.revokeObjectURL(url);
   };
 
+  // 密聊卡片底色变体：同为暗红基调，各群按群 id 稳定取色（同一群颜色固定，不同群略有差异，便于区分）
+  const WHISPER_TONES = [
+    { card: 'bg-red-950/50 border-red-900/70', text: 'text-red-100/90', tag: 'text-red-400/90' },
+    { card: 'bg-rose-950/50 border-rose-900/70', text: 'text-rose-100/90', tag: 'text-rose-400/90' },
+    { card: 'bg-orange-950/50 border-orange-900/70', text: 'text-orange-100/90', tag: 'text-orange-400/90' },
+    { card: 'bg-pink-950/50 border-pink-900/70', text: 'text-pink-100/90', tag: 'text-pink-400/90' },
+    { card: 'bg-amber-950/50 border-amber-900/70', text: 'text-amber-100/90', tag: 'text-amber-400/90' },
+  ];
+  // 按群 id 哈希稳定选色（不随刷新变化；群 id 缺失时回落红色）
+  const whisperTone = (gid: string | undefined) => {
+    if (!gid) return WHISPER_TONES[0];
+    let h = 0;
+    for (let i = 0; i < gid.length; i++) h = (h * 31 + gid.charCodeAt(i)) >>> 0;
+    return WHISPER_TONES[h % WHISPER_TONES.length];
+  };
+
+  // 日志署名：char_name 存在且不是"守秘人"（如 KP 代掷角色 A）时优先显示角色名
+  const logSenderName = (log: DiceLog): string => {
+    if (!currentRoom) return '未知';
+    return (log.char_name && log.char_name !== '守秘人')
+      ? log.char_name
+      : (log.user_id === currentRoom.creator_id
+        ? '守秘人'
+        : (currentRoom.members.find(m => m.user_id === log.user_id)?.profile?.display_name || '未知'));
+  };
+
+  // 弹窗头像：角色发言/检定显示角色头像（PL 的 PC、KP 代掷的角色）；
+  // 角色无头像或未加载到时，兜底为发言人自己的用户头像，最终兜底全局默认头像
+  const avatarForLog = (log: DiceLog): string | null => {
+    if (log.character_id) {
+      const char = allCharacters[log.character_id];
+      if (char?.avatar) return char.avatar;
+    }
+    const speaker = currentRoom?.members.find(m => m.user_id === log.user_id);
+    return speaker?.profile?.avatar_url || DEFAULT_AVATAR;
+  };
+
+  // 掷骰结果 / 发言悬浮弹窗卡片：掷骰框上方靠左显示——左侧圆角矩形头像（约占中心空白高度 1/5~1/4），
+  // 右侧内容框略低于头像，字号加大
+  const renderToastCard = (log: DiceLog) => {
+    const isWhisper = log.msg_type === 'whisper';
+    const isSpeech = log.msg_type === 'speech';
+    const isCheckType = log.msg_type === 'check' || log.msg_type === 'hidden';
+    const tone = isWhisper ? whisperTone((log.payload?.group_id as string | undefined) || undefined) : null;
+    const avatar = avatarForLog(log);
+    const name = logSenderName(log);
+
+    return (
+      <div className="dice-toast-in pointer-events-auto relative flex items-start gap-3">
+        {/* 头像（圆角矩形；各层级均无头像时显示全局默认头像） */}
+        <div className="h-[14vh] min-h-20 aspect-square rounded-2xl overflow-hidden border-2 border-slate-600 bg-slate-800 flex-shrink-0 shadow-xl">
+          <img src={avatar || DEFAULT_AVATAR} alt="" className="w-full h-full object-cover" />
+        </div>
+
+        {/* 内容框：略低于头像 */}
+        <div
+          className={`flex-1 min-w-0 mt-[3vh] rounded-2xl border p-3.5 shadow-xl ${
+            tone
+              ? tone.card
+              : isSpeech
+                ? 'bg-blue-950/60 border-blue-900/70'
+                : 'bg-slate-900/95 border-slate-700'
+          }`}
+        >
+          {/* 首行：署名 + 类型徽标 */}
+          <div className="flex items-center gap-2 mb-1.5">
+            <span className="text-xs font-black px-2 py-0.5 bg-slate-700/80 text-slate-200 rounded tracking-tight flex-shrink-0">
+              {name}
+            </span>
+            {isWhisper && tone && <span className={`text-[11px] font-bold ${tone.tag}`}>🤫 密聊·{log.label}</span>}
+            {isSpeech && <span className="text-[11px] text-blue-300">💬 房间发言</span>}
+          </div>
+
+          {/* 内容：发言/密聊显示正文；检定显示项目 + 出目 + 等级；其余类型显示描述 */}
+          {isCheckType && log.roll !== null ? (
+            <div className="flex items-baseline justify-between gap-3">
+              <div className="font-bold text-base text-slate-100 min-w-0 truncate">{log.label}</div>
+              <div className="font-mono text-xs text-slate-400 flex-shrink-0">
+                Roll: <b className="text-white">{log.roll}</b>/{log.target}
+              </div>
+              <div className={`font-black text-lg italic flex-shrink-0 ${getLevelClass(log.level)}`}>{log.level}</div>
+            </div>
+          ) : log.msg_type === 'custom' ? (
+            <div className="flex items-baseline justify-between gap-3">
+              <div className="font-bold text-base text-slate-100 min-w-0 truncate">{log.label}</div>
+              <div className="font-black text-lg text-cyan-300 flex-shrink-0">{log.roll}</div>
+            </div>
+          ) : isWhisper || isSpeech ? (
+            <div className={`text-[15px] leading-relaxed whitespace-pre-wrap break-words ${tone?.text ?? 'text-blue-100/90'}`}>
+              {log.level}
+            </div>
+          ) : (
+            <div className="text-[15px] text-slate-200">{log.label || log.level}</div>
+          )}
+        </div>
+
+        {/* 左上角 10 秒剩余时间圆环 */}
+        <div className="absolute -top-1.5 -left-1.5 w-6 h-6 text-cyan-400 drop-shadow z-10">
+          <svg viewBox="0 0 16 16" className="w-full h-full -rotate-90">
+            <circle cx="8" cy="8" r="6.5" fill="none" stroke="currentColor" strokeOpacity="0.25" strokeWidth="2" />
+            <circle
+              cx="8"
+              cy="8"
+              r="6.5"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeDasharray="40.84"
+              className="dice-toast-ring"
+            />
+          </svg>
+        </div>
+      </div>
+    );
+  };
+
   // 单条日志卡片渲染（LOGS 面板与掷骰结果悬浮提示共用）
   // showDelete：是否显示悬停删除按钮（KP 对所有记录显示；PL 仅对自己的笔记显示）
   const renderLogCard = (log: DiceLog, showDelete: boolean) => {
     if (!currentRoom) return null;
-    const sender = currentRoom.members.find(m => m.user_id === log.user_id);
-    const senderName = isCreator && log.user_id === currentRoom.creator_id
-      ? '守秘人'
-      : (log.char_name || sender?.profile?.display_name || '未知');
+    const senderName = logSenderName(log);
     const isCheckType = log.msg_type === 'check' || log.msg_type === 'hidden';
     const isNote = log.msg_type === 'note';
     const isSpeech = log.msg_type === 'speech';
     const isWhisper = log.msg_type === 'whisper';
+    // 密聊消息按所属群取暗红基调色变体（已解散群从历史消息的 payload 中仍可取到群 id）
+    const tone = isWhisper ? whisperTone((log.payload?.group_id as string | undefined) || undefined) : null;
 
     return (
       <div
         key={log.id}
         className={`group relative p-2.5 rounded-lg border transition-all ${
-          isWhisper
-            ? 'bg-red-950/50 border-red-900/70'
+          tone
+            ? tone.card
             : isSpeech
               ? 'bg-blue-950/40 border-blue-900/60'
               : isNote
@@ -569,7 +806,8 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
                 : 'bg-slate-800/70 border-slate-700/60'
         }`}
       >
-        {showDelete && (
+        {/* 密聊记录与房间发言一样任何人不可删除：不显示删除按钮（RLS DELETE 策略同样排除 whisper） */}
+        {showDelete && log.msg_type !== 'whisper' && (
           <button
             onClick={() => handleDeleteLog(log)}
             title="删除这条记录"
@@ -582,7 +820,7 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
         <div className="flex justify-between items-start mb-1 gap-2">
           <div className="text-slate-500 text-[9px] font-mono flex items-center gap-1.5 pt-0.5">
             {formatLogTime(log.created_at)}
-            {isWhisper && <span className="text-red-400/90">🤫 密聊·{log.label}</span>}
+            {isWhisper && tone && <span className={tone.tag}>🤫 密聊·{log.label}</span>}
             {isSpeech && <span className="text-blue-400">💬 房间发言</span>}
             {isNote && <span className="text-cyan-600">📝 仅自己可见</span>}
           </div>
@@ -625,7 +863,7 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
             </div>
           </>
         ) : isWhisper ? (
-          <div className="text-[13px] text-red-100/90 whitespace-pre-wrap break-words leading-relaxed">
+          <div className={`text-[13px] whitespace-pre-wrap break-words leading-relaxed ${tone?.text ?? 'text-red-100/90'}`}>
             {log.level}
           </div>
         ) : isSpeech ? (
@@ -922,15 +1160,22 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
       && m.role !== 'kp'
   );
   
-  // 构造 KP 成员对象
-  const kpMember = {
-    id: `kp-${currentRoom.creator_id}`,
-    user_id: currentRoom.creator_id,
-    role: 'kp' as const,
-    status: 'active' as const,
-    character_id: null as string | null,
-    profile: currentRoom.creator || undefined,
-  };
+  // 构造 KP 成员对象：优先使用数据库中的实际成员记录（含 KPC 的 character_id）
+  const kpMemberActual = currentRoom.members.find(m => m.user_id === currentRoom.creator_id);
+  const kpMember = kpMemberActual
+    ? { ...kpMemberActual, profile: currentRoom.creator || kpMemberActual.profile }
+    : {
+        id: `kp-${currentRoom.creator_id}`,
+        user_id: currentRoom.creator_id,
+        role: 'kp' as const,
+        status: 'active' as const,
+        character_id: null as string | null,
+        revealed_sections: null,
+        joined_at: '',
+        left_at: null,
+        room_id: currentRoom.id,
+        profile: currentRoom.creator || undefined,
+      };
   
   // 排序：KP 在前，其他活跃成员在后
   const sortedActiveMembers = [
@@ -938,10 +1183,16 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
     ...activeMembers,
   ];
 
+  // 成员列表附角色名（PC名（PL名）展示用；NPC/怪物不计入，密聊群只含真实成员）
+  const membersWithCharName = currentRoom.members.map(m => ({
+    ...m,
+    character_name: (m.character_id && allCharacters[m.character_id]?.name) || null,
+  }));
+
   return (
-    <div className="min-h-screen bg-slate-900 text-white flex">
+    <div className="h-screen overflow-hidden bg-slate-900 text-white flex">
       {/* 左侧侧边栏 - 成员列表 */}
-      <aside className="w-80 bg-slate-800 border-r border-slate-700 flex flex-col">
+      <aside className="w-72 bg-slate-800 border-r border-slate-700 flex flex-col">
         <div className="p-4 border-b border-slate-700">
           <h3 className="text-lg font-bold flex items-center gap-2">
             <span>👥</span> 房间成员
@@ -1005,11 +1256,11 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
                   <div className={`w-10 h-10 rounded-full flex items-center justify-center text-lg font-bold overflow-hidden flex-shrink-0 ${
                     isKP ? 'bg-purple-600' : 'bg-cyan-700'
                   }`}>
-                    {member.profile?.avatar_url ? (
-                      <img src={member.profile.avatar_url} alt="" className="w-full h-full object-cover" />
-                    ) : (
-                      <span>{(member.profile?.display_name || '?')[0]}</span>
-                    )}
+                    <img
+                      src={member.profile?.avatar_url || DEFAULT_AVATAR}
+                      alt=""
+                      className="w-full h-full object-cover"
+                    />
                   </div>
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2">
@@ -1027,24 +1278,37 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
                 </div>
 
                 {/* 下方角色卡片（点击查看角色卡浮窗） */}
-                {!isKP && character && (
+                {character && (
                   <div className="px-4 pb-3 pl-16">
                     <div
                       className="flex items-center gap-2 mt-2 cursor-pointer hover:bg-slate-700/60 rounded-lg px-2 py-1.5 -mx-2 transition"
                       title="查看角色卡"
                       onClick={() => { if (character) setViewCard(character); }}
                     >
-                      <div className="w-8 h-8 rounded-lg bg-cyan-600 flex items-center justify-center text-sm font-bold overflow-hidden">
-                        {character.avatar ? (
-                          <img src={character.avatar} alt="" className="w-full h-full object-cover" />
-                        ) : (
-                          <span>{character.name[0]}</span>
-                        )}
+                      <div className={`w-8 h-8 rounded-lg flex items-center justify-center text-sm font-bold overflow-hidden ${
+                        isKP ? 'bg-purple-600' : 'bg-cyan-600'
+                      }`}>
+                        <img src={character.avatar || DEFAULT_AVATAR} alt="" className="w-full h-full object-cover" />
                       </div>
-                      <span className="text-xs font-medium text-cyan-300 truncate max-w-32">
+                      <span className={`text-xs font-medium truncate max-w-32 ${
+                        isKP ? 'text-purple-300' : 'text-cyan-300'
+                      }`}>
                         {character.name}
                       </span>
                     </div>
+                  </div>
+                )}
+
+                {/* KP 无 KPC 时显示导入按钮 */}
+                {isKP && !character && isMe && (
+                  <div className="px-4 pb-3 pl-16">
+                    <button
+                      onClick={() => setKpcImportOpen(true)}
+                      className="flex items-center gap-2 mt-2 px-2 py-1.5 rounded-lg border border-dashed border-purple-700/60 text-[11px] text-purple-300/80 hover:bg-purple-900/30 transition w-full"
+                    >
+                      <span className="w-8 h-8 rounded-lg border border-dashed border-purple-700/60 flex items-center justify-center text-base">＋</span>
+                      <span>导入 KPC</span>
+                    </button>
                   </div>
                 )}
 
@@ -1063,11 +1327,11 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
               >
                 <div className="flex items-center gap-3 flex-1 min-w-0">
                   <div className="w-10 h-10 rounded-full bg-slate-600 flex items-center justify-center text-lg font-bold overflow-hidden">
-                    {member.profile?.avatar_url ? (
-                      <img src={member.profile.avatar_url} alt="" className="w-full h-full object-cover" />
-                    ) : (
-                      <span>{(member.profile?.display_name || '?')[0]}</span>
-                    )}
+                    <img
+                      src={member.profile?.avatar_url || DEFAULT_AVATAR}
+                      alt=""
+                      className="w-full h-full object-cover"
+                    />
                   </div>
                   <div className="min-w-0">
                     <div className="flex items-center gap-1">
@@ -1085,11 +1349,7 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
                       title="查看角色卡"
                       onClick={() => { if (character) setViewCard(character); }}
                     >
-                      {character.avatar ? (
-                        <img src={character.avatar} alt="" className="w-full h-full object-cover" />
-                      ) : (
-                        <span className="text-slate-400">{character.name[0]}</span>
-                      )}
+                      <img src={character.avatar || DEFAULT_AVATAR} alt="" className="w-full h-full object-cover" />
                     </button>
                   )}
                 </div>
@@ -1148,11 +1408,7 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
                         <div className={`w-8 h-8 rounded-lg flex items-center justify-center text-xs font-bold overflow-hidden flex-shrink-0 ${
                           isMobSection ? 'bg-red-700' : 'bg-emerald-700'
                         }`}>
-                          {c.avatar ? (
-                            <img src={c.avatar} alt="" className="w-full h-full object-cover" />
-                          ) : (
-                            c.name[0]
-                          )}
+                          <img src={c.avatar || DEFAULT_AVATAR} alt="" className="w-full h-full object-cover" />
                         </div>
                         <span className="text-xs font-medium text-slate-300 truncate flex-1">
                           {instanceLabel(entry)}
@@ -1209,8 +1465,8 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
         </div>
       </aside>
 
-      {/* 右侧主内容区域 */}
-      <div className="flex-1 flex flex-col">
+      {/* 右侧主内容区域（min-h-0 配合根元素 h-screen，保证内部历史记录栏独立滚动） */}
+      <div className="flex-1 min-h-0 flex flex-col">
         {/* 顶部导航 */}
         <header className="flex justify-between items-center px-6 py-4 border-b border-slate-800 bg-slate-900">
           <div className="flex items-center gap-2">
@@ -1272,15 +1528,180 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
           </div>
         </header>
 
-        {/* 主内容区：掷骰功能开发中提示（底部留白避开悬浮掷骰面板，使其在可见区居中） */}
-        <div className="flex-1 min-h-0 flex items-center justify-center pb-[calc(33vh+1rem)]">
-          <span className="text-slate-600 text-lg tracking-[0.3em] font-bold select-none">
-            掷骰功能仍在开发中，下方简易掷骰仅作简单测试用，不代表最终效果
-          </span>
+        {/* 主内容区：中央提示 + 右列（历史记录面板 + 输入区，常态显示） */}
+        <div className="flex-1 min-h-0 flex gap-3 px-4 pb-4">
+          {/* 中央提示（底部留白避开悬浮掷骰面板） */}
+          <div className="flex-1 min-w-0 flex items-center justify-center pb-[calc(25vh-0.5rem)]">
+            <span className="text-slate-600 text-lg tracking-[0.3em] font-bold select-none">
+              掷骰功能仍在开发中，下方简易掷骰仅作简单测试用，不代表最终效果
+            </span>
+          </div>
+
+          {/* 右列：历史记录（上）+ 输入区（下） */}
+          <div className="w-[22rem] flex-shrink-0 flex flex-col gap-2 min-h-0">
+            {/* 历史记录面板 */}
+            <div className="flex-1 min-h-0 bg-slate-900/85 backdrop-blur border border-slate-700 rounded-2xl shadow-2xl flex flex-col overflow-hidden">
+              {/* 头部：标题 + 设置 / 导出 */}
+              <div className="px-3 py-2.5 border-b border-slate-700 flex items-center gap-2 flex-shrink-0">
+                <span>📜</span>
+                <span className="font-bold text-sm">历史记录</span>
+                <span className="text-[10px] text-slate-500">
+                  {visibleDiceLogs.length}{diceLogs.length !== visibleDiceLogs.length && `/${diceLogs.length}`}
+                </span>
+                <div className="ml-auto flex items-center gap-1.5">
+                  <button
+                    onClick={() => setLogFilterOpen(v => !v)}
+                    title="设置显示内容"
+                    className={`w-7 h-7 rounded-md border text-xs transition ${
+                      logFilterOpen
+                        ? 'bg-cyan-700 border-cyan-600 text-white'
+                        : 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-300'
+                    }`}
+                  >
+                    ⚙
+                  </button>
+                  <button
+                    onClick={exportLogs}
+                    title="导出为 TXT（按当前显示内容）"
+                    className="px-2 py-1 rounded-md bg-slate-800 hover:bg-slate-700 border border-slate-700 text-[10px] font-bold text-cyan-300 transition"
+                  >
+                    ⬇ EXPORT TXT
+                  </button>
+                </div>
+              </div>
+
+              {/* 日志列表（单机版卡片式渲染，按设置过滤） */}
+              <div ref={logListRef} className="flex-1 overflow-y-auto p-3 space-y-2">
+                {visibleDiceLogs.length === 0 && (
+                  <p className="text-center text-slate-600 text-xs py-10 italic">
+                    {diceLogs.length === 0 ? '暂无掷骰记录，等待第一掷…' : '当前筛选条件下没有记录'}
+                  </p>
+                )}
+
+                {visibleDiceLogs.map(log =>
+                  renderLogCard(
+                    log,
+                    // 房间发言任何人（含 KP）都不可删除
+                    log.msg_type !== 'speech' && (isCreator || (log.msg_type === 'note' && log.user_id === userId))
+                  )
+                )}
+              </div>
+            </div>
+
+            {/* 输入区：频道（公屏/密聊）与笔记共用输入框 */}
+            <div className="relative bg-slate-900/90 backdrop-blur border border-slate-700 rounded-2xl shadow-2xl p-2.5 flex flex-col gap-1.5 flex-shrink-0">
+              {/* 当前模式提示行 */}
+              <div className="flex items-center gap-1.5 text-[10px] min-h-[16px]">
+                {noteMode ? (
+                  <span className="px-2 py-0.5 rounded-full bg-amber-900/60 border border-amber-700 text-amber-200 font-bold">
+                    📝 笔记模式 · 仅自己可见
+                  </span>
+                ) : channel === 'public' ? (
+                  <span className="px-2 py-0.5 rounded-full bg-blue-950/60 border border-blue-800 text-blue-200 font-bold">
+                    💬 公屏 · 全体可见
+                  </span>
+                ) : (
+                  <span className="px-2 py-0.5 rounded-full bg-red-950/60 border border-red-800 text-red-200 font-bold max-w-[10rem] truncate">
+                    🤫 密聊 · {privateGroups.find(g => g.id === channel)?.name ?? ''}
+                  </span>
+                )}
+                {channel !== 'public' && !noteMode && (() => {
+                  const g = privateGroups.find(x => x.id === channel);
+                  const muted = g && !isCreator && !g.members.find(m => m.user_id === userId)?.can_speak;
+                  return muted ? <span className="text-red-400">🔇 已被禁言</span> : null;
+                })()}
+                {inputBusy && <span className="text-slate-500 ml-auto">发送中…</span>}
+              </div>
+
+              <textarea
+                value={inputText}
+                onChange={e => setInputText(e.target.value)}
+                onKeyDown={e => {
+                  if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault();
+                    handleSendInput();
+                  }
+                }}
+                rows={2}
+                placeholder={
+                  noteMode
+                    ? '输入剧情笔记（仅自己可见）…'
+                    : channel === 'public'
+                      ? '在公屏发言…'
+                      : `在「${privateGroups.find(g => g.id === channel)?.name ?? ''}」中密聊…`
+                }
+                className="w-full px-2.5 py-2 bg-slate-950/70 border border-slate-700 rounded-xl text-xs text-white outline-none focus:border-cyan-500 resize-none transition placeholder:text-slate-600"
+              />
+
+              {/* 按钮行：频道 / 笔记 / KP 角色选择 / 发送 */}
+              <div className="flex items-center gap-1.5">
+                <button
+                  onClick={() => { if (noteMode) setNoteMode(false); setChannelMenuOpen(v => !v); }}
+                  title="切换发言频道（公屏 / 密聊群）；笔记模式下点击可切回发言模式"
+                  className={`px-2.5 py-1.5 rounded-lg text-[11px] font-bold border transition ${
+                    channel === 'public' && !noteMode
+                      ? 'bg-blue-950/60 border-blue-800 text-blue-200 hover:bg-blue-900/60'
+                      : 'bg-red-950/60 border-red-800 text-red-200 hover:bg-red-900/60'
+                  }`}
+                >
+                  {channel === 'public' ? '频道：公屏' : `频道：${privateGroups.find(g => g.id === channel)?.name ?? '密聊'}`}
+                </button>
+                <button
+                  onClick={() => setNoteMode(v => !v)}
+                  title="笔记（仅自己可见，随记录导出 TXT）"
+                  className={`px-2.5 py-1.5 rounded-lg text-[11px] font-bold border transition ${
+                    noteMode
+                      ? 'bg-amber-800 border-amber-600 text-amber-50'
+                      : 'bg-amber-950/40 border-amber-900 text-amber-300/80 hover:bg-amber-900/50'
+                  }`}
+                >
+                  笔记
+                </button>
+                {/* KP 角色选择：发言/密聊署名（守秘人/KPC/NPC/怪物） */}
+                {isCreator && (
+                  <select
+                    value={kpSelectedCharName ?? ''}
+                    onChange={e => setKpSelectedCharName(e.target.value || null)}
+                    title="KP 发言署名角色"
+                    className="max-w-28 text-[11px] bg-slate-900/70 border border-slate-700 rounded-lg px-1.5 py-1.5 text-slate-300 outline-none focus:border-purple-500"
+                  >
+                    {kpCharOptions.map(opt => (
+                      <option key={opt.label} value={opt.name ?? ''}>{opt.label}</option>
+                    ))}
+                  </select>
+                )}
+                <button
+                  onClick={handleSendInput}
+                  disabled={inputBusy || !inputText.trim()}
+                  className="ml-auto px-4 py-1.5 bg-cyan-600 hover:bg-cyan-500 rounded-lg text-[11px] font-bold text-white transition disabled:opacity-40"
+                >
+                  发送
+                </button>
+              </div>
+
+              {/* 频道选择弹窗：公屏 / 密聊群列表（KP 含建群、禁言、解散管理） */}
+              {channelMenuOpen && (
+                <>
+                  <div className="fixed inset-0 z-40" onClick={() => setChannelMenuOpen(false)} />
+                  <PrivateChatPanel
+                    roomId={currentRoom.id}
+                    userId={userId}
+                    isCreator={isCreator}
+                    members={membersWithCharName}
+                    groups={privateGroups}
+                    selectedGroupId={channel === 'public' ? null : channel}
+                    onSelectGroup={gid => setChannel(gid ?? 'public')}
+                    notifyChanged={notifyPrivateChanged}
+                    onClose={() => setChannelMenuOpen(false)}
+                  />
+                </>
+              )}
+            </div>
+          </div>
         </div>
 
-        {/* 底部掷骰面板（悬浮窗）：贴页面下方、避开左侧角色栏（w-80）、高约 1/3；内容单行排布，不做内部滚动 */}
-        <div className="fixed left-[21rem] right-4 bottom-4 z-30 h-[33vh] min-h-[15rem] rounded-2xl border border-slate-700 bg-slate-900/85 backdrop-blur shadow-2xl p-4 flex flex-col gap-3 overflow-hidden">
+        {/* 底部掷骰面板（悬浮窗）：贴页面下方、避开左侧角色栏与右侧历史记录列；内容单行排布，不做内部滚动 */}
+        <div className="fixed left-[19rem] right-[24rem] bottom-4 z-30 h-[25vh] min-h-[13rem] rounded-2xl border border-slate-700 bg-slate-900/85 backdrop-blur shadow-2xl p-4 flex flex-col gap-3 overflow-hidden">
           {/* 页签行 */}
           <div className="flex items-center gap-3 flex-shrink-0">
             <div className="flex gap-1 p-1 bg-slate-800/80 rounded-xl">
@@ -1437,171 +1858,18 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
         </div>
       </div>
 
-      {/* LOGS 悬浮按钮：页面最右缘垂直居中，点击展开掷骰记录侧栏 */}
-      {!logsOpen && (
-        <button
-          onClick={() => { setLogsOpen(true); setLogsTouched(false); }}
-          title="掷骰记录"
-          className="fixed right-0 top-1/2 -translate-y-1/2 z-40 bg-slate-800/90 hover:bg-slate-700 border border-r-0 border-slate-600 rounded-l-lg px-1 py-5 shadow-lg transition"
-        >
-          <span
-            className="text-[10px] font-black tracking-[0.35em] text-cyan-400"
-            style={{ writingMode: 'vertical-rl' }}
-          >
-            LOGS
-          </span>
-        </button>
-      )}
-
-      {/* 掷骰记录悬浮侧栏：默认半透明覆盖在页面之上，点击面板内部转为不透明；
-          不加全屏遮罩，面板之外的页面交互不受影响 */}
-      {logsOpen && (
-        <aside
-          onClick={() => setLogsTouched(true)}
-          className={`fixed right-0 top-1/2 -translate-y-1/2 z-50 w-[420px] max-w-[92vw] h-[82vh] rounded-l-2xl border border-r-0 border-slate-700 flex flex-col shadow-2xl transition-colors duration-200 ${
-            logsTouched ? 'bg-slate-900' : 'bg-slate-900/70'
-          }`}
-        >
-          {/* 头部：标题 + 设置 / 导出 / 关闭（笔记按钮已移至右下角悬浮按钮） */}
-          <div className="px-4 py-3 border-b border-slate-700 flex items-center gap-2 flex-shrink-0">
-            <span>📜</span>
-            <span className="font-bold text-sm">历史记录</span>
-            <span className="text-[10px] text-slate-500">
-              {visibleDiceLogs.length}{diceLogs.length !== visibleDiceLogs.length && `/${diceLogs.length}`}
-            </span>
-            <div className="ml-auto flex items-center gap-1.5">
-              <button
-                onClick={() => setLogFilterOpen(v => !v)}
-                title="设置显示内容"
-                className={`w-7 h-7 rounded-md border text-xs transition ${
-                  logFilterOpen
-                    ? 'bg-cyan-700 border-cyan-600 text-white'
-                    : 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-300'
-                }`}
-              >
-                ⚙
-              </button>
-              <button
-                onClick={exportLogs}
-                title="导出为 TXT（按当前显示内容）"
-                className="px-2 py-1 rounded-md bg-slate-800 hover:bg-slate-700 border border-slate-700 text-[10px] font-bold text-cyan-300 transition"
-              >
-                ⬇ EXPORT TXT
-              </button>
-              <button
-                onClick={() => setLogsOpen(false)}
-                title="收起"
-                className="w-6 h-6 rounded-md text-slate-400 hover:text-white hover:bg-slate-700 transition text-sm leading-none"
-              >
-                ✕
-              </button>
-            </div>
-          </div>
-
-          {/* 日志列表（单机版卡片式渲染，按设置过滤） */}
-          <div ref={logListRef} className="flex-1 overflow-y-auto p-3 space-y-2">
-            {visibleDiceLogs.length === 0 && (
-              <p className="text-center text-slate-600 text-xs py-10 italic">
-                {diceLogs.length === 0 ? '暂无掷骰记录，等待第一掷…' : '当前筛选条件下没有记录'}
-              </p>
-            )}
-
-            {visibleDiceLogs.map(log =>
-              renderLogCard(
-                log,
-                // 房间发言任何人（含 KP）都不可删除
-                log.msg_type !== 'speech' && (isCreator || (log.msg_type === 'note' && log.user_id === userId))
-              )
-            )}
-          </div>
-        </aside>
-      )}
-
-      {/* 掷骰结果悬浮提示：底部掷骰面板之上锚定堆叠——新骰子入队把先出现的顶上去；
-          左上角圆环为 6 秒剩余时间，点击提示可展开完整记录侧栏。
-          右缘避让发言/笔记圆形按钮（w-11 + 间距） */}
-      <div className="fixed right-[5.75rem] bottom-[calc(33vh+1.25rem)] z-[45] w-[420px] max-w-[70vw] flex flex-col gap-2 pointer-events-none">
-        {rollToasts.map(log => (
-          <div
-            key={log.id}
-            className="dice-toast-in pointer-events-auto relative shadow-xl rounded-lg cursor-pointer"
-            onClick={() => { setLogsOpen(true); setLogsTouched(false); }}
-          >
-            {renderLogCard(log, false)}
-            <div className="absolute -top-1.5 -left-1.5 w-5 h-5 text-cyan-400 drop-shadow">
-              <svg viewBox="0 0 16 16" className="w-full h-full -rotate-90">
-                <circle cx="8" cy="8" r="6.5" fill="none" stroke="currentColor" strokeOpacity="0.25" strokeWidth="2" />
-                <circle
-                  cx="8"
-                  cy="8"
-                  r="6.5"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  strokeDasharray="40.84"
-                  className="dice-toast-ring"
-                />
-              </svg>
-            </div>
-          </div>
-        ))}
+      {/* 掷骰结果 / 发言悬浮弹窗：掷骰框上方靠左锚定堆叠——新弹窗入队把先出现的顶上去，
+          左侧头像 + 右侧内容框，左上角圆环为 10 秒剩余时间；左缘与掷骰面板对齐 */}
+      <div className="fixed left-[19rem] bottom-[calc(25vh+1.25rem)] z-[45] w-[34rem] max-w-[calc(100vw-44.5rem)] flex flex-col gap-3 pointer-events-none">
+        {rollToasts.map(log => renderToastCard(log))}
       </div>
 
-      {/* 左侧悬浮按钮组（紧贴左侧角色栏右侧）：密聊（暗红，上）/ 笔记（棕色）/ 发言（蓝色，下）；
-          位于底部掷骰面板之上。密聊按钮：KP 常显；PL 仅在被 KP 拉入密聊群后出现 */}
-      <div
-        className="fixed left-[21rem] z-[46] bottom-[calc(33vh+1.5rem)] flex flex-col items-center gap-2.5"
-      >
-        {(isCreator || privateGroups.length > 0) && (
-          <button
-            onClick={() => setPrivatePanelOpen(v => !v)}
-            title={isCreator ? '密聊（创建 / 管理密聊群）' : '密聊'}
-            className={`w-11 h-11 rounded-full shadow-lg shadow-black/40 flex items-center justify-center transition active:scale-95 ${
-              privatePanelOpen
-                ? 'bg-red-800 ring-2 ring-red-500/60'
-                : 'bg-red-950 hover:bg-red-900'
-            }`}
-          >
-            <span className="text-[11px] font-black text-red-100">密聊</span>
-          </button>
-        )}
-        <button
-          onClick={() => setNoteModalOpen(true)}
-          title="添加私有笔记（仅自己可见）"
-          className="w-11 h-11 rounded-full bg-amber-800 hover:bg-amber-700 shadow-lg shadow-black/40 flex items-center justify-center transition active:scale-95"
-        >
-          <span className="text-[11px] font-black text-amber-50">笔记</span>
-        </button>
-        <button
-          onClick={() => setSpeechModalOpen(true)}
-          title="发言（全房间可见）"
-          className="w-11 h-11 rounded-full bg-blue-600 hover:bg-blue-500 shadow-lg shadow-black/40 flex items-center justify-center transition active:scale-95"
-        >
-          <span className="text-[11px] font-black text-blue-50">发言</span>
-        </button>
-      </div>
-
-      {/* 密聊小弹窗：选择当前发言群 / KP 建群、禁言、解散 */}
-      {privatePanelOpen && (
-        <PrivateChatPanel
-          roomId={currentRoom.id}
-          userId={userId}
-          isCreator={isCreator}
-          senderName={isCreator ? '守秘人' : displayName}
-          members={currentRoom.members}
-          groups={privateGroups}
-          notifyChanged={notifyPrivateChanged}
-          onClose={() => setPrivatePanelOpen(false)}
-        />
-      )}
-
-      {/* LOGS 显示内容设置：右侧跳出小弹窗（发言 / 掷骰 / 笔记，默认全选；TXT 导出同步遵循） */}
+      {/* LOGS 显示内容设置：右侧跳出小弹窗（发言 / 掷骰 / 笔记 + 各密聊群组，默认全选；TXT 导出同步遵循） */}
       {logFilterOpen && (
         <>
           {/* 透明点击层：点击弹窗外部关闭 */}
           <div className="fixed inset-0 z-[55]" onClick={() => setLogFilterOpen(false)} />
-          <div className="popup-slide-right fixed right-4 top-[20%] z-[56] w-60 bg-slate-800 border border-slate-700 rounded-2xl shadow-2xl p-4">
+          <div className="popup-slide-right fixed right-4 top-[20%] z-[56] w-60 max-h-[70vh] overflow-y-auto bg-slate-800 border border-slate-700 rounded-2xl shadow-2xl p-4">
             <div className="flex items-center justify-between mb-3">
               <h3 className="text-sm font-bold text-slate-200">显示内容</h3>
               <button
@@ -1645,6 +1913,43 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
               })}
             </div>
 
+            {/* 密聊群组逐群过滤（含已解散群：列表从历史密聊消息中提取） */}
+            {whisperGroupList.length > 0 && logFilter.speech && (
+              <div className="mt-3 pt-3 border-t border-slate-700/70">
+                <p className="text-[10px] font-black text-slate-500 uppercase tracking-widest mb-1.5">
+                  🤫 密聊群组
+                </p>
+                <div className="space-y-1">
+                  {whisperGroupList.map(g => {
+                    const checked = logFilter.whisperGroups[g.id] !== false;
+                    return (
+                      <label
+                        key={g.id}
+                        className="flex items-center gap-2.5 px-2 py-1.5 rounded-lg hover:bg-slate-700/60 cursor-pointer transition"
+                      >
+                        <span
+                          className={`w-4 h-4 rounded border flex items-center justify-center text-[10px] flex-shrink-0 transition ${
+                            checked
+                              ? 'bg-red-800 border-red-600 text-white'
+                              : 'bg-slate-900 border-slate-600 text-transparent'
+                          }`}
+                        >
+                          ✓
+                        </span>
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() => toggleWhisperGroupFilter(g.id)}
+                          className="sr-only"
+                        />
+                        <span className="text-xs truncate">{g.name}</span>
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
             <p className="mt-3 pt-3 border-t border-slate-700/70 text-[10px] text-slate-500 leading-relaxed">
               设置会即时生效，EXPORT TXT 导出的内容也按当前显示状态过滤。
             </p>
@@ -1653,117 +1958,6 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
       )}
 
       {Dialog}
-
-      {/* 添加私有笔记弹窗（仅自己可见，可随记录导出 TXT） */}
-      {noteModalOpen && (
-        <div
-          className="fixed inset-0 z-[70] flex items-center justify-center bg-slate-900/60 backdrop-blur-sm p-4"
-          onClick={() => { if (!noteBusy) setNoteModalOpen(false); }}
-        >
-          <div
-            className="bg-slate-800 border border-slate-700 rounded-2xl shadow-2xl w-full max-w-md overflow-hidden"
-            onClick={e => e.stopPropagation()}
-          >
-            <div className="p-4 border-b border-slate-700 flex justify-between items-center">
-              <h3 className="font-bold text-white">📝 添加剧情笔记</h3>
-              <button
-                onClick={() => setNoteModalOpen(false)}
-                disabled={noteBusy}
-                className="text-slate-400 hover:text-white disabled:opacity-50"
-              >
-                ✕
-              </button>
-            </div>
-
-            <div className="p-4">
-              <p className="text-[11px] text-slate-500 mb-2">
-                笔记仅自己可见，其他成员无法查看；会出现在你的记录列表中，并可随记录一并导出 TXT。
-              </p>
-              <textarea
-                autoFocus
-                value={noteText}
-                onChange={e => setNoteText(e.target.value)}
-                placeholder="在此输入剧情描述、个人备忘或关键线索..."
-                className="w-full h-36 p-3 bg-slate-900/70 border border-slate-700 rounded-xl text-sm text-white outline-none focus:border-cyan-500 resize-none transition"
-              />
-
-              <div className="mt-4 flex gap-3">
-                <button
-                  onClick={() => setNoteModalOpen(false)}
-                  disabled={noteBusy}
-                  className="flex-1 py-2.5 rounded-xl font-bold text-slate-400 hover:bg-slate-700 transition disabled:opacity-50"
-                >
-                  取消
-                </button>
-                <button
-                  onClick={handleSaveNote}
-                  disabled={noteBusy}
-                  className="flex-[2] py-2.5 bg-cyan-600 hover:bg-cyan-500 text-white rounded-xl font-bold transition disabled:opacity-50"
-                >
-                  {noteBusy ? '保存中...' : '保存并记录'}
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* 发言弹窗（内容对全房间可见，实时同步到 LOGS） */}
-      {speechModalOpen && (
-        <div
-          className="fixed inset-0 z-[70] flex items-center justify-center bg-slate-900/60 backdrop-blur-sm p-4"
-          onClick={() => { if (!speechBusy) setSpeechModalOpen(false); }}
-        >
-          <div
-            className="bg-slate-800 border border-slate-700 rounded-2xl shadow-2xl w-full max-w-md overflow-hidden"
-            onClick={e => e.stopPropagation()}
-          >
-            <div className="p-4 border-b border-slate-700 flex justify-between items-center">
-              <h3 className="font-bold text-white">💬 房间发言</h3>
-              <button
-                onClick={() => setSpeechModalOpen(false)}
-                disabled={speechBusy}
-                className="text-slate-400 hover:text-white disabled:opacity-50"
-              >
-                ✕
-              </button>
-            </div>
-
-            <div className="p-4">
-              <p className="text-[11px] text-slate-500 mb-2">
-                发言将展示给房间内所有成员，并记录在 LOGS 中。
-              </p>
-              <textarea
-                autoFocus
-                value={speechText}
-                onChange={e => setSpeechText(e.target.value)}
-                onKeyDown={e => {
-                  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) handleSaveSpeech();
-                }}
-                placeholder="说点什么…（Ctrl+Enter 发送）"
-                className="w-full h-32 p-3 bg-slate-900/70 border border-slate-700 rounded-xl text-sm text-white outline-none focus:border-blue-500 resize-none transition"
-              />
-
-              <div className="mt-4 flex gap-3">
-                <button
-                  onClick={() => setSpeechModalOpen(false)}
-                  disabled={speechBusy}
-                  className="flex-1 py-2.5 rounded-xl font-bold text-slate-400 hover:bg-slate-700 transition disabled:opacity-50"
-                >
-                  取消
-                </button>
-                <button
-                  onClick={handleSaveSpeech}
-                  disabled={speechBusy}
-                  className="flex-[2] py-2.5 bg-blue-600 hover:bg-blue-500 text-white rounded-xl font-bold transition disabled:opacity-50"
-                >
-                  {speechBusy ? '发送中...' : '发送'}
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
 
       {/* KP 添加 NPC / 怪物弹窗（由侧栏虚线加号框打开，类型由所在分区决定） */}
       {npcImportType && (
@@ -1775,11 +1969,22 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
         />
       )}
 
+      {/* KPC 导入弹窗：KP 从角色库选一个 PC 作为 KPC */}
+      {kpcImportOpen && (
+        <KpcImportModal
+          userId={userId}
+          busy={npcOpBusy}
+          onSelect={handleImportKpc}
+          onClose={() => setKpcImportOpen(false)}
+        />
+      )}
+
       {/* 角色卡查看浮窗：点击左侧角色栏的 PC/NPC/怪物打开（NPC/怪物仅 KP 可打开）。
           PC 卡：KP 端带揭示控件；其他 PL 端按房规 + 已揭示分区过滤；自己的卡完整可见 */}
       {viewCard && (() => {
+        // 查找角色卡所属的成员（PL 或 KP 的 KPC）
         const ownerMember = currentRoom.members.find(
-          m => m.role === 'pl' && m.character_id === viewCard.id
+          m => m.character_id === viewCard.id && (m.role === 'pl' || (m.role === 'kp' && m.user_id === currentRoom.creator_id))
         );
         const rules = rulesFromRoom(currentRoom);
         const revealed = ownerMember ? revealedFromMember(ownerMember.revealed_sections) : [];
@@ -2017,11 +2222,11 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
                       {isSelected && <span className="text-cyan-400 text-xs">✓</span>}
                     </div>
                     <div className="w-8 h-8 rounded-full bg-cyan-700 flex items-center justify-center text-sm font-bold overflow-hidden flex-shrink-0">
-                      {member.profile?.avatar_url ? (
-                        <img src={member.profile.avatar_url} alt="" className="w-full h-full object-cover" />
-                      ) : (
-                        <span>{(member.profile?.display_name || '?')[0]}</span>
-                      )}
+                      <img
+                        src={member.profile?.avatar_url || DEFAULT_AVATAR}
+                        alt=""
+                        className="w-full h-full object-cover"
+                      />
                     </div>
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2">

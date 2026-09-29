@@ -5,6 +5,7 @@ import toast from 'react-hot-toast';
 import type { CharacterState } from '../../(single)/page';
 import type { RoomNpcEntry } from './roomTypes';
 import { supabase } from '../../lib/supabase';
+import { DEFAULT_AVATAR } from '../../lib/constants';
 import { getRoomNpcEntries, addRoomNpcEntry } from './roomService';
 
 interface NpcImportModalProps {
@@ -103,11 +104,7 @@ export default function NpcImportModal({ userId, roomId, addType, onClose }: Npc
                     <div className={`w-9 h-9 rounded-lg flex items-center justify-center text-sm font-bold overflow-hidden flex-shrink-0 ${
                       isMobType ? 'bg-red-700' : 'bg-emerald-700'
                     }`}>
-                      {char.avatar ? (
-                        <img src={char.avatar} alt="" className="w-full h-full object-cover" />
-                      ) : (
-                        char.name[0]
-                      )}
+                      <img src={char.avatar || DEFAULT_AVATAR} alt="" className="w-full h-full object-cover" />
                     </div>
 
                     <div className="flex-1 min-w-0">

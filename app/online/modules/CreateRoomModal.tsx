@@ -1,18 +1,23 @@
 "use client";
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import toast from 'react-hot-toast';
+import { supabase } from '../../lib/supabase';
+import { DEFAULT_AVATAR } from '../../lib/constants';
 import { useRoom } from './RoomContext';
+import { setKpcCharacter } from './roomService';
 import {
   CARD_SECTION_OPTIONS, DEFAULT_CARD_SECTIONS, DEFAULT_RULES,
   CRIT_MIN, CRIT_MAX, FUMBLE_MIN, FUMBLE_MAX,
 } from './roomRules';
 import type { CardSection, CardSectionsState, RoomRules } from './roomRules';
+import type { CharacterState } from '../../(single)/page';
 
 interface CreateRoomModalProps {
   isOpen: boolean;
   onClose: () => void;
   onRoomCreated?: (roomId: string) => void;
+  userId: string;
 }
 
 // 阈值步进器：只允许 +/- 上下调整，不允许手动输入
@@ -39,7 +44,7 @@ function ThresholdStepper({
   );
 }
 
-export function CreateRoomModal({ isOpen, onClose, onRoomCreated }: CreateRoomModalProps) {
+export function CreateRoomModal({ isOpen, onClose, onRoomCreated, userId }: CreateRoomModalProps) {
   const { createRoom, loadRoom } = useRoom();
   const [roomName, setRoomName] = useState('');
   const [sections, setSections] = useState<CardSectionsState>({ ...DEFAULT_CARD_SECTIONS });
@@ -48,6 +53,25 @@ export function CreateRoomModal({ isOpen, onClose, onRoomCreated }: CreateRoomMo
   const [crit, setCrit] = useState(DEFAULT_RULES.crit_threshold);
   const [fumble, setFumble] = useState(DEFAULT_RULES.fumble_threshold);
   const [submitting, setSubmitting] = useState(false);
+  // KPC 可选导入
+  const [pcChars, setPcChars] = useState<CharacterState[]>([]);
+  const [selectedKpcId, setSelectedKpcId] = useState<string>('');
+
+  // 加载 KP 角色库中的 PC 角色
+  useEffect(() => {
+    if (!isOpen || !userId) return;
+    (async () => {
+      const { data, error } = await supabase
+        .from('characters')
+        .select('data')
+        .eq('owner_id', userId);
+      if (error) return;
+      const list = (data || [])
+        .map((row: any) => row.data as CharacterState)
+        .filter(c => c.type === 'pc');
+      setPcChars(list);
+    })();
+  }, [isOpen, userId]);
 
   if (!isOpen) return null;
 
@@ -61,6 +85,7 @@ export function CreateRoomModal({ isOpen, onClose, onRoomCreated }: CreateRoomMo
     setEnableBurnLuck(true);
     setCrit(DEFAULT_RULES.crit_threshold);
     setFumble(DEFAULT_RULES.fumble_threshold);
+    setSelectedKpcId('');
   };
 
   const handleSubmit = async () => {
@@ -85,6 +110,13 @@ export function CreateRoomModal({ isOpen, onClose, onRoomCreated }: CreateRoomMo
     setSubmitting(true);
     try {
       const room = await createRoom({ name: trimmedName, rules });
+      // 如果选了 KPC，写入 KP 的成员记录
+      if (selectedKpcId) {
+        await setKpcCharacter(room.id, userId, selectedKpcId).catch(err => {
+          console.warn('KPC 设置失败（不影响房间创建）:', err);
+          toast.error('KPC 导入失败，可在房间内重新导入');
+        });
+      }
       await loadRoom(room.id);
       toast.success(`房间创建成功！房间号：${room.room_code}`);
       resetForm();
@@ -159,6 +191,45 @@ export function CreateRoomModal({ isOpen, onClose, onRoomCreated }: CreateRoomMo
                 </label>
               ))}
             </div>
+          </div>
+
+          {/* KPC 可选导入 */}
+          <div>
+            <label className="text-sm font-bold text-slate-200 block mb-2">KPC 导入（可选）</label>
+            <p className="text-xs text-slate-500 mb-3">
+              选择一个 PC 角色作为 KP 扮演的 KPC，其角色卡可见性同房规设置。可留空不导入。
+            </p>
+            {pcChars.length === 0 ? (
+              <p className="text-xs text-slate-600 py-2">角色库中暂无 PC 角色</p>
+            ) : (
+              <div className="space-y-1.5 bg-slate-900/50 border border-slate-700 rounded-xl p-3 max-h-40 overflow-y-auto">
+                <label className="flex items-center gap-2.5 text-sm text-slate-300 cursor-pointer">
+                  <input
+                    type="radio"
+                    name="kpc"
+                    checked={selectedKpcId === ''}
+                    onChange={() => setSelectedKpcId('')}
+                    className="accent-cyan-600"
+                  />
+                  <span className="text-slate-500">不导入 KPC</span>
+                </label>
+                {pcChars.map(char => (
+                  <label key={char.id} className="flex items-center gap-2.5 text-sm text-slate-300 cursor-pointer">
+                    <input
+                      type="radio"
+                      name="kpc"
+                      checked={selectedKpcId === char.id}
+                      onChange={() => setSelectedKpcId(char.id)}
+                      className="accent-cyan-600"
+                    />
+                    <div className="w-7 h-7 rounded-lg bg-cyan-700 flex items-center justify-center text-xs font-bold overflow-hidden flex-shrink-0">
+                      <img src={char.avatar || DEFAULT_AVATAR} alt="" className="w-full h-full object-cover" />
+                    </div>
+                    <span className="font-medium">{char.name}</span>
+                  </label>
+                ))}
+              </div>
+            )}
           </div>
 
           {/* 可选规则开关 */}
