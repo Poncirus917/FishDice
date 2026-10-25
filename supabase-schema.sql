@@ -777,4 +777,111 @@ DO $$
 BEGIN ALTER PUBLICATION supabase_realtime ADD TABLE public.private_group_members;
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
+-- ============================================
+-- 17. 房间背景图库（KP 自定义导入，最多 20 张；已建库的环境执行本节；幂等）
+-- ============================================
+-- rooms 表：当前使用的背景图与备注（null = 未设置）
+ALTER TABLE public.rooms ADD COLUMN IF NOT EXISTS background_url TEXT;
+ALTER TABLE public.rooms ADD COLUMN IF NOT EXISTS background_note TEXT;
+
+-- 图库表
+CREATE TABLE IF NOT EXISTS public.room_backgrounds (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  room_id UUID REFERENCES public.rooms(id) ON DELETE CASCADE NOT NULL,
+  url TEXT NOT NULL,
+  storage_path TEXT NOT NULL,
+  note TEXT,
+  created_by UUID REFERENCES auth.users(id) ON DELETE CASCADE NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_room_backgrounds_room ON public.room_backgrounds(room_id);
+
+-- RLS：房内成员可读；仅 KP 可增删改
+ALTER TABLE public.room_backgrounds ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Room members can read backgrounds" ON public.room_backgrounds;
+CREATE POLICY "Room members can read backgrounds" ON public.room_backgrounds
+  FOR SELECT TO authenticated
+  USING (public.is_room_creator(room_id, auth.uid()) OR public.is_room_member(room_id, auth.uid()));
+
+DROP POLICY IF EXISTS "KP can add backgrounds" ON public.room_backgrounds;
+CREATE POLICY "KP can add backgrounds" ON public.room_backgrounds
+  FOR INSERT TO authenticated
+  WITH CHECK (public.is_room_creator(room_id, auth.uid()) AND created_by = auth.uid());
+
+DROP POLICY IF EXISTS "KP can update backgrounds" ON public.room_backgrounds;
+CREATE POLICY "KP can update backgrounds" ON public.room_backgrounds
+  FOR UPDATE TO authenticated
+  USING (public.is_room_creator(room_id, auth.uid()));
+
+DROP POLICY IF EXISTS "KP can delete backgrounds" ON public.room_backgrounds;
+CREATE POLICY "KP can delete backgrounds" ON public.room_backgrounds
+  FOR DELETE TO authenticated
+  USING (public.is_room_creator(room_id, auth.uid()));
+
+-- Data API 显式授权（2026-10-30 起 public 新表不再自动授权，必须显式 GRANT）
+GRANT SELECT ON public.room_backgrounds TO anon;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.room_backgrounds TO authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.room_backgrounds TO service_role;
+
+-- Storage 桶：背景图（公开读取；登录用户可上传；仅上传者本人可删除）
+INSERT INTO storage.buckets (id, name, public)
+VALUES ('room-backgrounds', 'room-backgrounds', true)
+ON CONFLICT (id) DO NOTHING;
+
+DROP POLICY IF EXISTS "Anyone can read room backgrounds" ON storage.objects;
+CREATE POLICY "Anyone can read room backgrounds" ON storage.objects
+  FOR SELECT USING (bucket_id = 'room-backgrounds');
+
+-- 上传/删除仅限该房间的 KP（路径首段为 room_id）
+DROP POLICY IF EXISTS "Authenticated users can upload room backgrounds" ON storage.objects;
+CREATE POLICY "KP can upload room backgrounds" ON storage.objects
+  FOR INSERT TO authenticated
+  WITH CHECK (
+    bucket_id = 'room-backgrounds'
+    AND public.is_room_creator((storage.foldername(name))[1]::uuid, auth.uid())
+  );
+
+DROP POLICY IF EXISTS "Owner can delete room backgrounds" ON storage.objects;
+CREATE POLICY "KP can delete room backgrounds" ON storage.objects
+  FOR DELETE TO authenticated
+  USING (
+    bucket_id = 'room-backgrounds'
+    AND public.is_room_creator((storage.foldername(name))[1]::uuid, auth.uid())
+  );
+
+-- ============================================
+-- 18. 密聊群内掷骰 / 检定请求的可见范围
+-- ============================================
+-- check / custom / request 若 payload 携带 group_id，则与 whisper 同等对待：
+-- 仅该群成员与 KP 可读；PL 只能写入自己可发言（can_speak=true）的群。
+-- payload->>'group_id' 为 NULL 时维持原来的全房可见 / 全房可写。
+
+DROP POLICY IF EXISTS "Room members can read dice logs" ON dice_logs;
+CREATE POLICY "Room members can read dice logs" ON dice_logs
+  FOR SELECT TO authenticated
+  USING (
+    (public.is_room_creator(room_id, auth.uid()) OR public.is_room_member(room_id, auth.uid()))
+    AND (msg_type <> 'hidden' OR public.is_room_creator(room_id, auth.uid()))
+    AND (msg_type <> 'note' OR user_id = auth.uid())
+    AND (
+      (payload->>'group_id') IS NULL
+      OR public.is_room_creator(room_id, auth.uid())
+      OR public.is_private_group_member(CAST(payload->>'group_id' AS UUID), auth.uid())
+    )
+  );
+
+DROP POLICY IF EXISTS "Room members can insert dice logs" ON dice_logs;
+CREATE POLICY "Room members can insert dice logs" ON dice_logs
+  FOR INSERT TO authenticated
+  WITH CHECK (
+    (public.is_room_creator(room_id, auth.uid()) OR public.is_room_member(room_id, auth.uid()))
+    AND (msg_type <> 'hidden' OR public.is_room_creator(room_id, auth.uid()))
+    AND (
+      (payload->>'group_id') IS NULL
+      OR public.is_room_creator(room_id, auth.uid())
+      OR public.is_private_group_speaker(CAST(payload->>'group_id' AS UUID), auth.uid())
+    )
+  );
+
 NOTIFY pgrst, 'reload schema';

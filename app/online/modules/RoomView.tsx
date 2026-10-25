@@ -1,15 +1,17 @@
 "use client";
 
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import toast from 'react-hot-toast';
+import Swal from 'sweetalert2';
 import { useRoom } from './RoomContext';
 import { useConfirmDialog } from './ConfirmDialog';
 import NpcImportModal from './NpcImportModal';
 import CharacterCardModal from './CharacterCardModal';
 import KpcImportModal from './KpcImportModal';
 import PrivateChatPanel, { usePrivateGroups } from './PrivateChatPanel';
+import BackgroundGallery from './BackgroundGallery';
 import { supabase } from '../../lib/supabase';
-import { DEFAULT_AVATAR } from '../../lib/constants';
+import { DEFAULT_AVATAR, DEFAULT_BACKGROUND } from '../../lib/constants';
 import type { DiceGroup } from '../../utils/dice';
 import type { CharacterState } from '../../(single)/page';
 import type { RoomNpcEntry, DiceLog } from './roomTypes';
@@ -25,7 +27,7 @@ interface RoomViewProps {
 }
 
 export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby }: RoomViewProps) {
-  const { currentRoom, loading, pauseRoom, deleteRoom, leaveRoom, detachFromRoom, loadRoom, renameRoom, broadcastMemberRemoved, diceLogs, performCheck, performCustomRoll, broadcastToRoom } = useRoom();
+  const { currentRoom, loading, pauseRoom, deleteRoom, leaveRoom, detachFromRoom, loadRoom, renameRoom, setRoomBackground, broadcastMemberRemoved, diceLogs, performCheck, performCustomRoll, sendCheckRequest, broadcastToRoom } = useRoom();
   const { showConfirm, Dialog } = useConfirmDialog();
   const [allCharacters, setAllCharacters] = useState<Record<string, CharacterState>>({});
   const [roomNpcEntries, setRoomNpcEntries] = useState<RoomNpcEntry[]>([]);
@@ -39,6 +41,11 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
   const [roomSettingsOpen, setRoomSettingsOpen] = useState(false);
   // 房间信息弹窗（点击头部房间号方框打开；KP/PL 均可查看房规）
   const [rulesInfoOpen, setRulesInfoOpen] = useState(false);
+  // KP 背景图库弹窗
+  const [bgGalleryOpen, setBgGalleryOpen] = useState(false);
+  // 中央背景区实际宽高比（导入裁剪时使用）
+  const bgAreaRef = useRef<HTMLDivElement>(null);
+  const [bgAspect, setBgAspect] = useState(16 / 9);
   // KP 揭示角色卡分区的请求锁
   const [revealBusy, setRevealBusy] = useState(false);
   const [selectedMembers, setSelectedMembers] = useState<string[]>([]);
@@ -51,8 +58,11 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
 
   // 掷骰面板
   const [rollTab, setRollTab] = useState<'check' | 'custom'>('check');
+  // 技能检定：checkLabel/checkTarget 由角色卡模糊搜索选中写入（不再手动输目标值）
   const [checkLabel, setCheckLabel] = useState('');
   const [checkTarget, setCheckTarget] = useState<number | ''>('');
+  const [checkSearch, setCheckSearch] = useState('');
+  const [checkSearchFocused, setCheckSearchFocused] = useState(false);
   const [selectedEntryId, setSelectedEntryId] = useState<string>('');
   // 自由掷骰
   const [freeLabel, setFreeLabel] = useState('');
@@ -69,6 +79,21 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
   const [channel, setChannel] = useState<'public' | string>('public');
   // 频道选择弹窗（含 KP 建群 / 禁言 / 解散管理）
   const [channelMenuOpen, setChannelMenuOpen] = useState(false);
+  // 掷骰频道：'public' = 公屏（默认）；其他值 = 密聊群 id（仅可发言群可选）
+  const [rollChannel, setRollChannel] = useState<'public' | string>('public');
+
+  // ---------- KP 检定请求 ----------
+  // KP 发起弹窗
+  const [requestModalOpen, setRequestModalOpen] = useState(false);
+  const [reqLabel, setReqLabel] = useState('');
+  // 请求发起频道：公屏或某个密聊群
+  const [reqChannel, setReqChannel] = useState<'public' | string>('public');
+  const [reqTargets, setReqTargets] = useState<Set<string>>(new Set());
+  const [reqBusy, setReqBusy] = useState(false);
+  // 已取消的请求 id（KP 广播取消；仅本会话有效，刷新后历史取消的请求会重新显示）
+  const [cancelledRequestIds, setCancelledRequestIds] = useState<Set<string>>(new Set());
+  // PL 已弹过提示的请求 id（避免重复弹窗）
+  const promptedRequestsRef = useRef<Set<string>>(new Set());
 
   // LOGS 显示内容过滤：发言 / 掷骰 / 笔记 + 各密聊群（含已解散群，默认全选；偏好存 localStorage）
   const [logFilter, setLogFilter] = useState<{
@@ -128,6 +153,72 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
   const isCreator = currentRoom?.creator_id === userId;
   const myMembership = currentRoom?.members.find(m => m.user_id === userId);
   const myRole = isCreator ? 'kp' : (myMembership?.role || 'pl');
+
+  // 密聊频道可选范围：KP 全部群；PL 仅本人 can_speak=true 的群
+  const speakableGroups = isCreator
+    ? privateGroups
+    : privateGroups.filter(g => g.members.some(m => m.user_id === userId && m.can_speak));
+  // 当前掷骰频道对应的密聊群（public → null）
+  const rollGroup = rollChannel === 'public'
+    ? null
+    : (speakableGroups.find(g => g.id === rollChannel) ?? null);
+
+  // 掷骰频道失效（群被解散 / 本人被禁言）时回退到公屏
+  useEffect(() => {
+    if (rollChannel !== 'public' && !speakableGroups.some(g => g.id === rollChannel)) {
+      setRollChannel('public');
+    }
+  }, [rollChannel, privateGroups, userId, isCreator]);
+
+  // 检定请求的候选目标：公屏=全体 PL；密聊群=该群内的 PL（被禁言者不可选）
+  const reqGroup = reqChannel === 'public'
+    ? null
+    : (privateGroups.find(g => g.id === reqChannel) ?? null);
+  const reqGroupSpeakableIds = new Set(
+    (reqGroup?.members ?? []).filter(m => m.can_speak).map(m => m.user_id)
+  );
+  const reqGroupMemberIds = new Set((reqGroup?.members ?? []).map(m => m.user_id));
+  const reqCandidates = (currentRoom?.members ?? []).filter(m =>
+    m.role !== 'kp' && (reqChannel === 'public' || reqGroupMemberIds.has(m.user_id))
+  );
+
+  // 掷骰频道选择器：公屏（默认）或本人可发言的密聊群
+  const rollChannelSelect = (
+    <div className="flex items-center gap-1.5 flex-shrink-0">
+      <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest">频道</span>
+      <select
+        value={rollChannel}
+        onChange={e => setRollChannel(e.target.value)}
+        title="掷骰结果发送到哪个频道"
+        className="w-36 bg-slate-900/70 border border-slate-700 rounded-xl px-2 py-2 text-xs outline-none focus:border-cyan-500 transition"
+      >
+        <option value="public">公屏（默认）</option>
+        {speakableGroups.map(g => (
+          <option key={g.id} value={g.id}>密聊 · {g.name}</option>
+        ))}
+      </select>
+    </div>
+  );
+
+  // 追踪中央背景区实际宽高比（导入裁剪时按此比例输出）
+  useEffect(() => {
+    const el = bgAreaRef.current;
+    if (!el) return;
+    const update = () => {
+      const rect = el.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) setBgAspect(rect.width / rect.height);
+    };
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [currentRoom?.id]);
+
+  // KP：应用 / 移除当前背景（url=null 表示移除）
+  const handleApplyBackground = async (url: string | null, note: string | null) => {
+    if (!currentRoom) return;
+    await setRoomBackground(currentRoom.id, url, note);
+  };
 
   // 加载房间所有角色：成员（PL）角色 + KP 通过 room_npcs 导入的 NPC/怪物
   useEffect(() => {
@@ -307,6 +398,42 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
   // KP 导入的 KPC（KP 扮演的 PC 角色）：可参与技能检定
   const kpcCharacter = isCreator && myCharacterId ? allCharacters[myCharacterId] ?? null : null;
 
+  // ---------- 技能检定：以角色卡数值为依据的模糊搜索 ----------
+  // 检定所依据的角色卡：PL = 自己角色；KP = 代掷下拉所选（KPC / NPC / 怪物）
+  const checkCharacter = isCreator
+    ? (selectedEntryId === 'kpc'
+        ? kpcCharacter
+        : npcOptions.find(o => o.entryId === selectedEntryId)?.character
+          ?? npcOptions[0]?.character
+          ?? kpcCharacter)
+    : (myCharacterId ? allCharacters[myCharacterId] ?? null : null);
+
+  // 可检定项：属性 + 技能合并，剔除 HP/MP/SAN/LUCK 伪技能（与单机版一致）
+  const CHECK_BLACKLIST = ['体力（hp）', '魔法（mp）', '理智（san）', '幸运（luck）', 'hp', 'mp', 'san', 'luck'];
+  const checkSelectable: Array<{ name: string; value: number }> = checkCharacter
+    ? (() => {
+        const base = Object.entries({ ...(checkCharacter.attributes || {}), ...(checkCharacter.skills || {}) })
+          .filter(([name]) => !CHECK_BLACKLIST.includes(name.toLowerCase()))
+          .map(([name, value]) => ({ name, value: Number(value) || 0 }));
+        // 理智/幸运是独立状态值（不在属性与技能字典里），按当前值追加为可检定项；同名键以状态值为准
+        const merged = new Map(base.map(it => [it.name, it]));
+        merged.set('理智', { name: '理智', value: checkCharacter.san?.current ?? 0 });
+        merged.set('幸运', { name: '幸运', value: checkCharacter.luck?.current ?? 0 });
+        return [...merged.values()];
+      })()
+    : [];
+  // 模糊匹配：名称包含搜索词即可（与单机版一致）
+  const filteredCheckItems = checkSelectable.filter(it => it.name.toLowerCase().includes(checkSearch.trim().toLowerCase()));
+
+  // 切换检定角色（PL 换卡 / KP 切换代掷对象）时清空已选技能，避免残留旧卡数值
+  const checkCharId = checkCharacter?.id ?? null;
+  useEffect(() => {
+    setCheckLabel('');
+    setCheckTarget('');
+    setCheckSearch('');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [checkCharId]);
+
   // KP 发言/密聊时的角色选项：守秘人 / KPC / NPC / 怪物
   const kpCharOptions: Array<{ name: string | null; label: string }> = [
     { name: null, label: '守秘人' },
@@ -339,17 +466,21 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
     if (isCreator && npcOptions.length === 0 && !kpcCharacter) setRollTab('custom');
   }, [isCreator, npcOptions.length, kpcCharacter]);
 
-  // 检定：手动填写检定项目与目标值发起 1D100；KP 必须选定代掷的 NPC/怪物
+  // 检定：从角色卡模糊搜索选中技能/属性后发起 1D100；KP 必须选定代掷的 KPC/NPC/怪物
   const handlePerformCheck = async () => {
     const label = checkLabel.trim();
     const target = checkTarget === '' ? NaN : Number(checkTarget);
 
+    if (!checkCharacter) {
+      toast(isCreator ? '没有可代掷的角色，请使用自由掷骰' : '请先选择角色卡');
+      return;
+    }
     if (!label) {
-      toast('请填写检定项目（如：侦查）');
+      toast('请先搜索并选择检定项目');
       return;
     }
     if (!Number.isFinite(target) || target <= 0) {
-      toast('请填写有效的目标值');
+      toast('请从下拉列表选择检定项目（目标值取自角色卡）');
       return;
     }
 
@@ -372,6 +503,8 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
           target,
           characterId: pick.id,
           charName: pickName || pick.name,
+          groupId: rollGroup?.id ?? null,
+          groupName: rollGroup?.name ?? null,
         });
       } else {
         const myChar = myCharacterId ? allCharacters[myCharacterId] : null;
@@ -380,13 +513,23 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
           target,
           characterId: myCharacterId,
           charName: myChar?.name || displayName,
+          groupId: rollGroup?.id ?? null,
+          groupName: rollGroup?.name ?? null,
         });
       }
       setCheckLabel('');
       setCheckTarget('');
+      setCheckSearch('');
     } catch (err: any) {
       toast.error(err.message || '掷骰失败');
     }
+  };
+
+  // 选中一个检定项：写入名称与目标值（来自角色卡），搜索框同步显示技能名
+  const pickCheckItem = (item: { name: string; value: number }) => {
+    setCheckLabel(item.name);
+    setCheckTarget(item.value);
+    setCheckSearch(item.name);
   };
 
   // 自由掷骰：NdM 多组骰子 + 加值（KP 无角色时的唯一掷骰方式）
@@ -399,7 +542,14 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
 
     try {
       if (isCreator) {
-        await performCustomRoll({ label: freeLabel, groups: validGroups, bonus: freeBonus, charName: kpSelectedCharName || '守秘人' });
+        await performCustomRoll({
+          label: freeLabel,
+          groups: validGroups,
+          bonus: freeBonus,
+          charName: kpSelectedCharName || '守秘人',
+          groupId: rollGroup?.id ?? null,
+          groupName: rollGroup?.name ?? null,
+        });
       } else {
         const myChar = myCharacterId ? allCharacters[myCharacterId] : null;
         await performCustomRoll({
@@ -408,6 +558,8 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
           bonus: freeBonus,
           characterId: myCharacterId,
           charName: myChar?.name || displayName,
+          groupId: rollGroup?.id ?? null,
+          groupName: rollGroup?.name ?? null,
         });
       }
       setFreeLabel('');
@@ -434,10 +586,13 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
   };
 
   // 检定等级 → 颜色
+  // 六级判定颜色梯度：成功侧 大成功/极难/困难/普通 由亮绿到绿递进，失败侧同理
   const getLevelClass = (level: string | null) => {
     if (!level) return 'text-slate-300';
     if (level === '大成功') return 'text-emerald-300';
-    if (level.includes('成功')) return 'text-green-400';
+    if (level === '极难成功') return 'text-teal-300';
+    if (level === '困难成功') return 'text-green-300';
+    if (level === '成功') return 'text-green-400';
     if (level === '大失败') return 'text-red-300';
     return 'text-red-400';
   };
@@ -451,25 +606,31 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
     t === 'note' ? 'note' : (t === 'speech' || t === 'whisper') ? 'speech' : 'dice';
 
   // 历史记录面板当前实际展示的日志（受设置弹窗的复选框控制）：
-  // 密聊消息额外按群过滤（含已解散群，群列表从历史日志中提取）
+  // 密聊消息与密聊群内掷骰额外按群过滤（含已解散群，群列表从历史日志中提取）
   const visibleDiceLogs = diceLogs.filter(l => {
     if (l.msg_type === 'whisper') {
       if (!logFilter.speech) return false;
       const gid = (l.payload?.group_id as string | undefined) ?? '';
       return logFilter.whisperGroups[gid] !== false;
     }
-    return logFilter[getLogCategory(l.msg_type)];
+    if (!logFilter[getLogCategory(l.msg_type)]) return false;
+    // 密聊群内的掷骰 / 请求：跟随该群的显示开关
+    const gid = (l.payload?.group_id as string | undefined) ?? '';
+    return !gid || logFilter.whisperGroups[gid] !== false;
   });
 
-  // 历史日志中出现过的密聊群（含已解散群：解散后 whisper 消息仍保留）
+  // 历史日志中出现过的密聊群（含已解散群：解散后消息与掷骰记录仍保留）
   const whisperGroupList = (() => {
     const map = new Map<string, string>();
     diceLogs.forEach(l => {
-      if (l.msg_type !== 'whisper') return;
       const gid = l.payload?.group_id as string | undefined;
-      if (gid && !map.has(gid)) {
-        map.set(gid, (l.payload?.group_name as string | undefined) || l.label || '未命名群');
-      }
+      if (!gid || map.has(gid)) return;
+      map.set(
+        gid,
+        (l.payload?.group_name as string | undefined)
+          || (l.msg_type === 'whisper' ? l.label : '')
+          || '未命名群'
+      );
     });
     return [...map.entries()].map(([id, name]) => ({ id, name }));
   })();
@@ -495,6 +656,195 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
     });
   };
 
+  // ---------- KP 检定请求：派生数据与处理 ----------
+  // 全部检定请求行（msg_type='request'，按时间正序）
+  const checkRequests = diceLogs.filter(l => l.msg_type === 'request');
+
+  // 聚合某个请求的应答进度：按 payload.request_id 匹配 PL 的 check 应答行，每人取最新一次。
+  // 仅统计"有几人已掷"，不判定通过与否——过没过、通过后如何处理由 KP 自行判断。
+  const getRequestProgress = (req: DiceLog) => {
+    const rid = (req.payload?.request_id as string | undefined) ?? '';
+    const targetIds = ((req.payload?.user_ids as string[] | undefined) ?? []);
+    const byUser = new Map<string, DiceLog>();
+    if (rid) {
+      diceLogs.forEach(l => {
+        if (l.msg_type === 'check' && l.payload?.request_id === rid) {
+          byUser.set(l.user_id, l);
+        }
+      });
+    }
+    const isSuccess = (l: DiceLog) => !!l.level && l.level.includes('成功');
+    const rolledCount = byUser.size;
+    const done = targetIds.length > 0 && rolledCount >= targetIds.length;
+    return { rid, targetIds, byUser, rolledCount, done, isSuccess };
+  };
+
+  // 成员 user_id → 显示名（KP 请求卡片 / 发起弹窗用）
+  const memberNameOf = (uid: string) =>
+    (currentRoom?.members ?? []).find(m => m.user_id === uid)?.profile?.display_name || '未知玩家';
+
+  // 检定项目 → 目标值：理智=当前SAN、幸运=当前幸运，技能/属性按卡面（卡上没有则不掷）
+  const resolveCheckTarget = (char: CharacterState, label: string): number => {
+    if (label === '理智') return char.san?.current ?? 0;
+    if (label === '幸运') return char.luck?.current ?? 0;
+    const skills = (char.skills || {}) as Record<string, number>;
+    const attrs = (char.attributes || {}) as Record<string, number>;
+    if (label in skills) return Number(skills[label]) || 0;
+    if (label in attrs) return Number(attrs[label]) || 0;
+    return 0;
+  };
+
+  // PL 应答检定请求：目标值取自己角色卡，应答行携带 request_id 供各端聚合；
+  // 卡上没有该技能/属性时不掷骰（无"默认 5%"设定）
+  const handleAnswerRequest = useCallback(async (req: DiceLog) => {
+    const myChar = myCharacterId ? allCharacters[myCharacterId] : null;
+    if (!myChar) {
+      toast.error('请先在左侧选择你的角色卡');
+      return;
+    }
+    const known = req.label === '理智' || req.label === '幸运'
+      || (req.label in ((myChar.skills || {}) as object))
+      || (req.label in ((myChar.attributes || {}) as object));
+    if (!known) {
+      toast.error(`你的角色卡上没有「${req.label}」，无法应答该检定`);
+      return;
+    }
+    // 密聊群内请求：应答必须在该群可发言，且掷骰结果只回传给群内成员
+    const reqGroupId = (req.payload?.group_id as string | undefined) || null;
+    const reqGroupName = (req.payload?.group_name as string | undefined) || null;
+    if (reqGroupId) {
+      const group = privateGroups.find(g => g.id === reqGroupId);
+      const mine = group?.members.find(m => m.user_id === userId);
+      if (!mine?.can_speak) {
+        toast.error('你已被禁言，无法在该密聊群中掷骰应答');
+        return;
+      }
+    }
+    try {
+      await performCheck({
+        label: req.label,
+        target: resolveCheckTarget(myChar, req.label),
+        characterId: myCharacterId,
+        charName: myChar.name,
+        groupId: reqGroupId,
+        groupName: reqGroupName,
+        payload: { request_id: (req.payload?.request_id as string | undefined) ?? '' },
+      });
+      toast.success(`已应答「${req.label}」检定`);
+    } catch (err: any) {
+      toast.error(err.message || '掷骰失败');
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [myCharacterId, allCharacters, performCheck, privateGroups, userId]);
+
+  // KP：打开发起弹窗（默认公屏、全选在场 PL）
+  const openRequestModal = () => {
+    const pls = (currentRoom?.members ?? []).filter(m => m.role !== 'kp');
+    setReqChannel('public');
+    setReqTargets(new Set(pls.map(m => m.user_id)));
+    setReqLabel('');
+    setRequestModalOpen(true);
+  };
+
+  // KP：切换请求频道（密聊群仅可选该群内可发言的 PL）
+  const handleReqChannelChange = (next: string) => {
+    setReqChannel(next);
+    if (next === 'public') {
+      const pls = (currentRoom?.members ?? []).filter(m => m.role !== 'kp');
+      setReqTargets(new Set(pls.map(m => m.user_id)));
+    } else {
+      const group = privateGroups.find(g => g.id === next);
+      setReqTargets(new Set((group?.members ?? []).filter(m => m.can_speak).map(m => m.user_id)));
+    }
+  };
+
+  // KP：勾选 / 取消请求目标玩家
+  const toggleReqTarget = (uid: string) => {
+    setReqTargets(prev => {
+      const next = new Set(prev);
+      if (next.has(uid)) next.delete(uid);
+      else next.add(uid);
+      return next;
+    });
+  };
+
+  // KP：发出检定请求
+  const handleSendRequest = async () => {
+    if (!reqLabel.trim()) { toast('请填写检定项目'); return; }
+    if (reqTargets.size === 0) { toast('请至少选择一名目标玩家'); return; }
+    if (reqChannel !== 'public' && !reqGroup) {
+      toast.error('该密聊群已不存在，请重新选择频道');
+      return;
+    }
+    setReqBusy(true);
+    try {
+      await sendCheckRequest({
+        label: reqLabel,
+        targetUserIds: [...reqTargets],
+        charName: kpSelectedCharName || '守秘人',
+        groupId: reqGroup?.id ?? null,
+        groupName: reqGroup?.name ?? null,
+      });
+      toast.success(reqGroup ? `检定请求已发到「${reqGroup.name}」` : '检定请求已发出');
+      setRequestModalOpen(false);
+    } catch (err: any) {
+      toast.error(err.message || '发送失败');
+    } finally {
+      setReqBusy(false);
+    }
+  };
+
+  // KP：取消检定请求（广播，各端本地隐藏该卡片；请求行仍保留在历史记录中）
+  const handleCancelRequest = async (rid: string) => {
+    setCancelledRequestIds(prev => new Set(prev).add(rid));
+    try {
+      await broadcastToRoom('check_request_cancelled', { request_id: rid });
+    } catch { /* 广播失败不影响本地取消 */ }
+  };
+
+  // 监听 KP 取消检定请求的广播（PL 端）
+  useEffect(() => {
+    const onCancel = (e: Event) => {
+      const rid = (e as CustomEvent).detail?.request_id as string | undefined;
+      if (rid) setCancelledRequestIds(prev => new Set(prev).add(rid));
+    };
+    window.addEventListener('check-request-cancelled', onCancel);
+    return () => window.removeEventListener('check-request-cancelled', onCancel);
+  }, []);
+
+  // PL 端：收到与自己相关的未完成检定请求时自动弹出提示（每个请求只弹一次）
+  useEffect(() => {
+    if (isCreator) return;
+    checkRequests.forEach(req => {
+      const p = getRequestProgress(req);
+      if (!p.rid || p.done) return;
+      if (!p.targetIds.includes(userId)) return;
+      if (p.byUser.has(userId)) return;
+      if (promptedRequestsRef.current.has(p.rid)) return;
+      promptedRequestsRef.current.add(p.rid);
+      Swal.fire({
+        title: '📣 KP 检定请求',
+        html: `KP 要求进行 <b class="text-cyan-600">${req.label}</b> 检定<br/>
+          <span class="text-xs text-slate-500">目标值自动取自你的角色卡</span>`,
+        icon: 'info',
+        showCancelButton: true,
+        confirmButtonText: '立即掷骰',
+        cancelButtonText: '稍后',
+        confirmButtonColor: '#0891b2',
+        cancelButtonColor: '#475569',
+        reverseButtons: true,
+      }).then(r => { if (r.isConfirmed) handleAnswerRequest(req); });
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [diceLogs, isCreator, userId]);
+
+  // 进行中的检定请求（未被取消，最新在上）；PL 只关心自己是目标的请求
+  const activeCheckRequests = checkRequests
+    .map(r => ({ req: r, p: getRequestProgress(r) }))
+    .filter(x => x.p.rid !== '' && !cancelledRequestIds.has(x.p.rid))
+    .reverse();
+  const myActiveRequests = activeCheckRequests.filter(x => x.p.targetIds.includes(userId));
+
   // 掷骰结果悬浮提示队列：新骰子从底部入队、先出现的被顶上去，10 秒后自动消失
   const [rollToasts, setRollToasts] = useState<DiceLog[]>([]);
   // 已弹过提示的日志 id（防止重复弹出）
@@ -506,6 +856,7 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
     const now = Date.now();
     const fresh = diceLogs.filter(l =>
       l.msg_type !== 'note' &&
+      l.msg_type !== 'request' &&
       !seenToastIdsRef.current.has(l.id) &&
       now - new Date(l.created_at).getTime() < 30000
     );
@@ -744,6 +1095,12 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
               {name}
             </span>
             {isWhisper && tone && <span className={`text-[11px] font-bold ${tone.tag}`}>🤫 密聊·{log.label}</span>}
+            {/* 密聊群内的掷骰 / 请求：标注所属群，仅群成员可见 */}
+            {!isWhisper && log.payload?.group_id && (
+              <span className={`text-[11px] font-bold ${tone?.tag ?? 'text-rose-400'}`}>
+                🤫 密聊·{(log.payload?.group_name as string) || '群聊'}
+              </span>
+            )}
             {isSpeech && <span className="text-[11px] text-blue-300">💬 房间发言</span>}
           </div>
 
@@ -804,6 +1161,7 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
     const isNote = log.msg_type === 'note';
     const isSpeech = log.msg_type === 'speech';
     const isWhisper = log.msg_type === 'whisper';
+    const isRequest = log.msg_type === 'request';
     // 密聊消息按所属群取暗红基调色变体（已解散群从历史消息的 payload 中仍可取到群 id）
     const tone = isWhisper ? whisperTone((log.payload?.group_id as string | undefined) || undefined) : null;
 
@@ -817,11 +1175,13 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
               ? 'bg-blue-950/40 border-blue-900/60'
               : isNote
                 ? 'bg-cyan-950/30 border-cyan-900/50'
-                : 'bg-slate-800/70 border-slate-700/60'
+                : isRequest
+                  ? 'bg-amber-950/30 border-amber-900/60'
+                  : 'bg-slate-800/70 border-slate-700/60'
         }`}
       >
-        {/* 密聊记录与房间发言一样任何人不可删除：不显示删除按钮（RLS DELETE 策略同样排除 whisper） */}
-        {showDelete && log.msg_type !== 'whisper' && (
+        {/* 检定请求行与发言一样不可删除 */}
+        {showDelete && log.msg_type !== 'whisper' && !isRequest && (
           <button
             onClick={() => handleDeleteLog(log)}
             title="删除这条记录"
@@ -837,13 +1197,20 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
             {isWhisper && tone && <span className={tone.tag}>🤫 密聊·{log.label}</span>}
             {isSpeech && <span className="text-blue-400">💬 房间发言</span>}
             {isNote && <span className="text-cyan-600">📝 仅自己可见</span>}
+            {isRequest && <span className="text-amber-400">📣 检定请求</span>}
           </div>
           <div className="text-[11px] font-black px-1.5 py-0.5 bg-slate-700/80 text-slate-300 rounded tracking-tight flex-shrink-0">
             {senderName}
           </div>
         </div>
 
-        {log.msg_type === 'hidden' ? (
+        {isRequest ? (
+          /* KP 的检定请求行：项目 + 已发送人数 */
+          <>
+            <div className="font-bold text-[14px] mb-1 text-amber-200">📣 {log.label}</div>
+            <div className="text-[11px] text-amber-200/70">{log.level}</div>
+          </>
+        ) : log.msg_type === 'hidden' ? (
           /* KP 视角的暗骰行（PL 端 RLS 收不到 hidden 行） */
           <>
             <div className="font-bold text-[14px] mb-1 text-purple-300">{log.label}</div>
@@ -1542,13 +1909,54 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
           </div>
         </header>
 
-        {/* 主内容区：中央提示 + 右列（历史记录面板 + 输入区，常态显示） */}
+        {/* 主内容区：中央背景区 + 右列（历史记录面板 + 输入区，常态显示） */}
         <div className="flex-1 min-h-0 flex gap-3 px-4 pb-4">
-          {/* 中央提示（底部留白避开悬浮掷骰面板） */}
-          <div className="flex-1 min-w-0 flex items-center justify-center pb-[calc(25vh-0.5rem)]">
-            <span className="text-slate-600 text-lg tracking-[0.3em] font-bold select-none">
-              掷骰功能仍在开发中，下方简易掷骰仅作简单测试用，不代表最终效果
-            </span>
+          {/* 中央列：背景区（上）+ 与底部悬浮掷骰面板等高的留白（下），两者不重合 */}
+          <div className="flex-1 min-w-0 min-h-0 flex flex-col">
+            <div ref={bgAreaRef} className="relative flex-1 min-h-0 rounded-2xl overflow-hidden bg-slate-900">
+              {/* 自定义背景优先；未设置或移除后回退到默认背景（不可删除） */}
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src={currentRoom.background_url || DEFAULT_BACKGROUND}
+                alt={currentRoom.background_note || '房间背景'}
+                className="absolute inset-0 w-full h-full object-cover select-none pointer-events-none"
+                draggable={false}
+              />
+              {/* 轻遮罩：压暗四周，保证前景内容可读 */}
+              <div className="absolute inset-0 bg-gradient-to-b from-slate-950/20 via-transparent to-slate-950/45 pointer-events-none" />
+
+            {/* KP 快捷操作：背景图库 / 移除当前背景 */}
+            {isCreator && (
+              <div className="absolute top-3 right-3 z-10 flex items-center gap-1.5">
+                <button
+                  onClick={() => setBgGalleryOpen(true)}
+                  title="打开背景图库"
+                  className="px-3 py-1.5 rounded-xl bg-slate-900/75 backdrop-blur border border-slate-700 text-slate-300 hover:text-white hover:border-cyan-600 text-[11px] font-bold transition"
+                >
+                  🖼 背景图库
+                </button>
+                {currentRoom.background_url && (
+                  <button
+                    onClick={() => handleApplyBackground(null, null)}
+                    title="移除当前背景"
+                    className="px-2.5 py-1.5 rounded-xl bg-slate-900/75 backdrop-blur border border-slate-700 text-slate-400 hover:text-red-300 hover:border-red-700 text-[11px] font-bold transition"
+                  >
+                    ✕
+                  </button>
+                )}
+              </div>
+            )}
+
+            {/* KP：当前背景备注（左上角，避开顶部快捷栏） */}
+            {isCreator && currentRoom.background_url && currentRoom.background_note && (
+              <div className="absolute top-3 left-3 z-10 px-2.5 py-1 rounded-lg bg-slate-950/60 backdrop-blur border border-slate-700/70 text-[10px] text-slate-300 max-w-[16rem] truncate">
+                🖼 {currentRoom.background_note}
+              </div>
+            )}
+            </div>
+
+            {/* 与底部悬浮掷骰面板等高留白：保证背景区不与下侧面板重合 */}
+            <div aria-hidden className="shrink-0 h-[calc(25vh+0.75rem)] min-h-[13.75rem]" />
           </div>
 
           {/* 右列：历史记录（上）+ 输入区（下） */}
@@ -1714,6 +2122,115 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
           </div>
         </div>
 
+        {/* KP 发起检定请求弹窗：项目 + 目标玩家（默认全选 PL；仅按勾选人数发送，不设通过条件） */}
+        {requestModalOpen && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={() => setRequestModalOpen(false)}>
+            <div className="absolute inset-0 bg-black/60" />
+            <div
+              className="relative w-96 max-w-[90vw] bg-slate-800 border border-slate-700 rounded-2xl shadow-2xl p-5 flex flex-col gap-4"
+              onClick={e => e.stopPropagation()}
+            >
+              <div className="flex items-center gap-2">
+                <span className="font-bold text-amber-300 text-sm">📣 发起检定请求</span>
+                <button
+                  onClick={() => setRequestModalOpen(false)}
+                  className="ml-auto w-7 h-7 rounded-lg text-slate-400 hover:text-white hover:bg-slate-700 transition text-sm leading-none"
+                >
+                  ✕
+                </button>
+              </div>
+
+              <div>
+                <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest">发起频道</label>
+                <select
+                  value={reqChannel}
+                  onChange={e => handleReqChannelChange(e.target.value)}
+                  className="mt-1.5 w-full bg-slate-900/70 border border-slate-700 rounded-xl px-3 py-2.5 text-sm outline-none focus:border-amber-500 transition"
+                >
+                  <option value="public">公屏（全房可见）</option>
+                  {privateGroups.map(g => (
+                    <option key={g.id} value={g.id}>密聊 · {g.name}</option>
+                  ))}
+                </select>
+                <p className="mt-1 text-[10px] text-slate-500">
+                  {reqGroup
+                    ? `仅「${reqGroup.name}」群成员可见并应答；被禁言的成员无法选择。`
+                    : '公屏发起时全房可见，所有 PL 都可应答。'}
+                </p>
+              </div>
+
+              <div>
+                <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest">检定项目</label>
+                <input
+                  autoFocus
+                  type="text"
+                  value={reqLabel}
+                  onChange={e => setReqLabel(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter') handleSendRequest(); }}
+                  placeholder="如：聆听 / 侦查 / 理智"
+                  className="mt-1.5 w-full bg-slate-900/70 border border-slate-700 rounded-xl px-4 py-2.5 text-sm outline-none focus:border-amber-500 transition"
+                />
+                <p className="mt-1 text-[10px] text-slate-500">玩家端目标值自动取自各自角色卡；卡上没有该技能的玩家将无法应答。过或没过由你自行判断。</p>
+              </div>
+
+              <div>
+                <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest">
+                  目标玩家（{reqChannel === 'public' ? '默认全选' : '仅该群可发言成员'}）
+                </label>
+                <div className="mt-1.5 flex flex-col gap-1 max-h-36 overflow-y-auto">
+                  {reqCandidates.length === 0 && (
+                    <p className="text-[11px] text-slate-500 italic py-2">
+                      该密聊群没有可应答的 PL（可能均已被禁言）。
+                    </p>
+                  )}
+                  {reqCandidates.map(m => {
+                    const muted = !!reqGroup && !reqGroupSpeakableIds.has(m.user_id);
+                    return (
+                      <label
+                        key={m.user_id}
+                        className={`flex items-center gap-2 text-sm cursor-pointer ${
+                          muted ? 'text-slate-600 cursor-not-allowed' : 'text-slate-300 hover:text-white'
+                        }`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={reqTargets.has(m.user_id)}
+                          disabled={muted}
+                          onChange={() => toggleReqTarget(m.user_id)}
+                          className="accent-amber-500"
+                        />
+                        <span className="truncate">{m.profile?.display_name || '未知玩家'}</span>
+                        {m.status === 'detached' && <span className="text-[10px] text-slate-500 flex-shrink-0">（暂离）</span>}
+                        {muted && <span className="text-[10px] text-slate-600 flex-shrink-0">（已禁言，无法应答）</span>}
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <button
+                onClick={handleSendRequest}
+                disabled={reqBusy}
+                className="w-full py-2.5 rounded-xl bg-amber-600 hover:bg-amber-500 text-white font-bold text-sm transition disabled:opacity-40"
+              >
+                {reqBusy ? '发送中…' : '发出请求'}
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* KP：背景图库（导入 / 备注 / 删除 / 设为背景） */}
+        {isCreator && bgGalleryOpen && (
+          <BackgroundGallery
+            roomId={currentRoom.id}
+            userId={userId}
+            activeUrl={currentRoom.background_url}
+            aspect={bgAspect}
+            onApply={handleApplyBackground}
+            onClose={() => setBgGalleryOpen(false)}
+          />
+        )}
+
         {/* 底部掷骰面板（悬浮窗）：贴页面下方、避开左侧角色栏与右侧历史记录列；内容单行排布，不做内部滚动 */}
         <div className="fixed left-[19rem] right-[24rem] bottom-4 z-30 h-[25vh] min-h-[13rem] rounded-2xl border border-slate-700 bg-slate-900/85 backdrop-blur shadow-2xl p-4 flex flex-col gap-3 overflow-hidden">
           {/* 页签行 */}
@@ -1746,61 +2263,131 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
                 检定类掷骰必须绑定角色：请先导入 KPC，或在左侧添加 NPC / 怪物并加入房间
               </p>
             )}
+            {/* KP：发起检定请求（指定若干玩家各掷一次） */}
+            {isCreator && (
+              <button
+                onClick={openRequestModal}
+                title="要求玩家进行某项检定"
+                className="ml-auto px-4 py-1.5 rounded-xl bg-amber-600/20 border border-amber-700/60 text-amber-300 hover:bg-amber-600/30 text-xs font-bold transition flex-shrink-0"
+              >
+                📣 请求检定
+              </button>
+            )}
           </div>
 
-          {/* 技能检定：单行布局 */}
+          {/* 左右两栏：左=掷骰操作，右=检定请求区 */}
+          <div className="flex-1 min-h-0 flex gap-3">
+            <div className="flex-1 min-w-0 min-h-0">
+
+          {/* 技能检定：两行布局（第一行角色 / 第二行搜索+三档数值+掷骰） */}
           {rollTab === 'check' && (
-            <div className="flex-1 min-h-0 flex items-center justify-center gap-3">
-              {isCreator ? (
-                <div className="flex items-center gap-2 flex-shrink-0">
-                  <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest">代掷角色</span>
-                  <select
-                    value={selectedEntryId || npcOptions[0]?.entryId || (kpcCharacter ? 'kpc' : '')}
-                    onChange={e => setSelectedEntryId(e.target.value)}
-                    className="w-44 bg-slate-900/70 border border-slate-700 rounded-xl px-3 py-2.5 text-sm outline-none focus:border-cyan-500"
-                  >
-                    {kpcCharacter && (
-                      <option key="kpc" value="kpc">KPC·{kpcCharacter.name}</option>
-                    )}
-                    {npcOptions.map(o => (
-                      <option key={o.entryId} value={o.entryId}>
-                        {o.character.type === 'mob' ? '怪物·' : 'NPC·'}{o.display}
-                      </option>
+            <div className="flex-1 min-h-0 flex flex-col justify-start gap-2.5">
+              {/* 第一行：掷骰角色 */}
+              <div className="flex items-center gap-2">
+                {isCreator ? (
+                  <div className="flex items-center gap-2 flex-shrink-0">
+                    <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest">代掷角色</span>
+                    <select
+                      value={selectedEntryId || npcOptions[0]?.entryId || (kpcCharacter ? 'kpc' : '')}
+                      onChange={e => setSelectedEntryId(e.target.value)}
+                      className="w-44 bg-slate-900/70 border border-slate-700 rounded-xl px-3 py-2.5 text-sm outline-none focus:border-cyan-500"
+                    >
+                      {kpcCharacter && (
+                        <option key="kpc" value="kpc">KPC·{kpcCharacter.name}</option>
+                      )}
+                      {npcOptions.map(o => (
+                        <option key={o.entryId} value={o.entryId}>
+                          {o.character.type === 'mob' ? '怪物·' : 'NPC·'}{o.display}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                ) : (
+                  /* PL 掷骰角色名：墨绿色圆角底框徽章 */
+                  <div className="flex-shrink-0 px-4 py-2.5 rounded-xl bg-emerald-950/70 border border-emerald-800/60 flex items-center gap-2">
+                    <span className="text-[10px] font-black text-emerald-500/90 uppercase tracking-widest">角色</span>
+                    <span className="text-[15px] font-bold text-emerald-100">
+                      {(myCharacterId && allCharacters[myCharacterId]?.name) || '未选择角色'}
+                    </span>
+                  </div>
+                )}
+                <div className="ml-auto">{rollChannelSelect}</div>
+              </div>
+              {/* 第二行：搜索 + 三档数值 + 掷骰 */}
+              <div className="flex items-center gap-2">
+              {/* 模糊搜索：以检定角色卡（PL 自己 / KP 代掷对象）的属性+技能为候选，选中后目标值取自卡片 */}
+              <div className="relative flex-1 min-w-0">
+                <input
+                  type="text"
+                  placeholder={checkCharacter ? '搜索技能或属性，如：侦查' : (isCreator ? '无可代掷角色' : '请先选择角色卡')}
+                  disabled={!checkCharacter}
+                  className="w-full bg-slate-900/70 border border-slate-700 rounded-xl px-4 py-2.5 text-[15px] outline-none focus:border-cyan-500 transition disabled:opacity-40"
+                  value={checkSearch}
+                  onFocus={() => setCheckSearchFocused(true)}
+                  onBlur={() => setCheckSearchFocused(false)}
+                  onChange={e => {
+                    const v = e.target.value;
+                    setCheckSearch(v);
+                    // 输入内容与已选技能名不一致时清空选择，防止用旧目标值掷骰
+                    if (v.trim() !== checkLabel) { setCheckLabel(v); setCheckTarget(''); }
+                  }}
+                  onKeyDown={e => {
+                    if (e.key !== 'Enter') return;
+                    // 未选中时 Enter 快速选中第一个匹配项；已选中则直接掷骰
+                    if (checkTarget === '' && filteredCheckItems.length > 0) {
+                      pickCheckItem(filteredCheckItems[0]);
+                      return;
+                    }
+                    handlePerformCheck();
+                  }}
+                />
+                {/* 上拉候选列表：仅在输入框有文字且聚焦时展开（与角色卡武器栏下拉一致） */}
+                {checkSearchFocused && checkSearch.trim() !== '' && filteredCheckItems.length > 0 && (
+                  <div className="absolute bottom-full mb-2 left-0 right-0 max-h-48 overflow-y-auto bg-slate-800/95 border border-slate-700 rounded-xl shadow-2xl shadow-black/50 z-50 py-1">
+                    {filteredCheckItems.map(it => (
+                      <button
+                        key={it.name}
+                        // onMouseDown 抢在输入框 blur 之前完成选中
+                        onMouseDown={e => { e.preventDefault(); pickCheckItem(it); }}
+                        className={`w-full flex items-center justify-between px-4 py-2 text-sm transition ${
+                          checkLabel === it.name && checkTarget !== ''
+                            ? 'bg-cyan-950/60 text-cyan-200'
+                            : 'text-slate-200 hover:bg-slate-700/80'
+                        }`}
+                      >
+                        <span className="font-bold truncate">{it.name}</span>
+                        <span className="font-mono text-cyan-300 flex-shrink-0 ml-3">{it.value}</span>
+                      </button>
                     ))}
-                  </select>
+                  </div>
+                )}
+              </div>
+              {/* 三档成功线：成功 = 卡面值，困难成功 = 1/2，极难成功 = 1/5（向下取整） */}
+              {checkTarget !== '' && Number(checkTarget) > 0 ? (
+                <div className="flex items-center gap-2 flex-shrink-0 text-xs font-bold">
+                  <span className="px-3 py-2 rounded-xl bg-cyan-950/60 border border-cyan-800/60 text-cyan-300 whitespace-nowrap">
+                    成功 <b className="text-sm font-black">≤{checkTarget}</b>
+                  </span>
+                  <span className="px-3 py-2 rounded-xl bg-indigo-950/60 border border-indigo-800/60 text-indigo-300 whitespace-nowrap">
+                    困难 <b className="text-sm font-black">≤{Math.floor(Number(checkTarget) / 2)}</b>
+                  </span>
+                  <span className="px-3 py-2 rounded-xl bg-purple-950/60 border border-purple-800/60 text-purple-300 whitespace-nowrap">
+                    极难 <b className="text-sm font-black">≤{Math.floor(Number(checkTarget) / 5)}</b>
+                  </span>
                 </div>
               ) : (
-                <p className="text-xs text-slate-500 flex-shrink-0">
-                  掷骰角色：
-                  <span className="text-cyan-400 font-bold">
-                    {(myCharacterId && allCharacters[myCharacterId]?.name) || '未选择角色'}
-                  </span>
+                <p className="text-xs text-slate-500 italic flex-shrink-0 whitespace-nowrap">
+                  {checkCharacter ? '搜索并选择技能后掷骰' : ''}
                 </p>
               )}
-              <input
-                type="text"
-                placeholder="检定项目，如：侦查"
-                className="flex-1 bg-slate-900/70 border border-slate-700 rounded-xl px-4 py-2.5 text-sm outline-none focus:border-cyan-500 transition"
-                value={checkLabel}
-                onChange={e => setCheckLabel(e.target.value)}
-                onKeyDown={e => { if (e.key === 'Enter') handlePerformCheck(); }}
-              />
-              <input
-                type="number"
-                min={1}
-                max={100}
-                placeholder="目标值，如：60"
-                className="w-28 bg-slate-900/70 border border-slate-700 rounded-xl px-4 py-2.5 text-sm outline-none focus:border-cyan-500 transition"
-                value={checkTarget}
-                onChange={e => setCheckTarget(e.target.value === '' ? '' : Number(e.target.value))}
-                onKeyDown={e => { if (e.key === 'Enter') handlePerformCheck(); }}
-              />
               <button
                 onClick={handlePerformCheck}
-                className="px-6 py-2.5 rounded-xl bg-cyan-600 hover:bg-cyan-500 font-bold text-sm transition active:scale-[0.99] flex-shrink-0"
+                disabled={!checkCharacter}
+                className="px-7 py-2.5 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white font-bold text-[15px] transition active:scale-[0.99] flex-shrink-0 disabled:opacity-40 disabled:cursor-not-allowed"
               >
-                掷 1D100
+                掷骰
               </button>
+              </div>
             </div>
           )}
 
@@ -1823,6 +2410,7 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
                   onChange={e => setFreeBonus(e.target.value === '' ? 0 : Number(e.target.value))}
                   onKeyDown={e => { if (e.key === 'Enter') handleFreeRoll(); }}
                 />
+                {rollChannelSelect}
                 <button
                   onClick={handleFreeRoll}
                   className="px-6 py-2.5 rounded-xl bg-cyan-600 hover:bg-cyan-500 font-bold text-sm transition active:scale-[0.99] flex-shrink-0"
@@ -1874,6 +2462,87 @@ export default function RoomView({ userId, displayName, avatarUrl, onBackToLobby
               </div>
             </div>
           )}
+            </div>
+
+            {/* 右栏：检定请求区（KP 看进度并管理，PL 看自己的待办并应答） */}
+            <div className="w-56 flex-shrink-0 border-l border-slate-700/70 pl-3 min-h-0 overflow-y-auto flex flex-col gap-2">
+              <p className="text-[10px] font-black text-slate-500 uppercase tracking-widest flex-shrink-0">📣 检定请求</p>
+
+              {(!isCreator ? myActiveRequests : activeCheckRequests).length === 0 && (
+                <p className="text-[11px] text-slate-600 italic py-1 leading-relaxed">
+                  {isCreator ? '暂无进行中的检定请求，点击上方「📣 请求检定」发起' : '暂无进行中的检定请求'}
+                </p>
+              )}
+
+              {(!isCreator ? myActiveRequests : activeCheckRequests).map(({ req, p }) => (
+                <div
+                  key={p.rid}
+                  className={`rounded-xl border p-2.5 flex flex-col gap-1.5 flex-shrink-0 ${
+                    p.done ? 'border-emerald-800/60 bg-emerald-950/30' : 'border-amber-800/60 bg-amber-950/20'
+                  }`}
+                >
+                  <div className="flex items-center gap-1.5 min-w-0">
+                    <span className="text-xs font-bold text-amber-200 truncate">{req.label}</span>
+                    {req.payload?.group_id && (
+                      <span className="text-[9px] font-bold text-rose-400 flex-shrink-0">
+                        🤫 {(req.payload?.group_name as string) || '密聊'}
+                      </span>
+                    )}
+                    {isCreator && (
+                      <button
+                        onClick={() => handleCancelRequest(p.rid)}
+                        title="取消请求"
+                        className="ml-auto text-slate-500 hover:text-red-400 text-xs leading-none flex-shrink-0"
+                      >
+                        ✕
+                      </button>
+                    )}
+                  </div>
+                  <div className="text-[10px] text-slate-500 flex-shrink-0">
+                    已掷 {p.rolledCount}/{p.targetIds.length}
+                    {p.done && ' · 已全部掷骰'}
+                  </div>
+
+                  {/* PL：已应答显示自己的结果，未应答时显示掷骰按钮 */}
+                  {!isCreator && (
+                    p.byUser.has(userId) ? (
+                      <div className={`text-[11px] font-bold ${p.isSuccess(p.byUser.get(userId)!) ? 'text-emerald-400' : 'text-red-400'}`}>
+                        我的出目 {p.byUser.get(userId)!.roll} · {p.byUser.get(userId)!.level}
+                      </div>
+                    ) : (
+                      <button
+                        onClick={() => handleAnswerRequest(req)}
+                        className="px-2 py-1.5 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white text-[11px] font-bold transition flex-shrink-0"
+                      >
+                        掷骰应答
+                      </button>
+                    )
+                  )}
+
+                  {/* KP：各目标玩家的应答明细 */}
+                  {isCreator && (
+                    <div className="flex flex-col gap-0.5">
+                      {p.targetIds.map(uid => {
+                        const log = p.byUser.get(uid);
+                        return (
+                          <div key={uid} className="flex items-center justify-between gap-2 text-[11px] min-w-0">
+                            <span className="text-slate-300 truncate">{memberNameOf(uid)}</span>
+                            {log ? (
+                              <span className={`font-bold flex-shrink-0 ${p.isSuccess(log) ? 'text-emerald-400' : 'text-red-400'}`}>
+                                {log.roll} {log.level}
+                              </span>
+                            ) : (
+                              <span className="text-slate-600 flex-shrink-0">未掷</span>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
         </div>
       </div>
 

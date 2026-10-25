@@ -1,5 +1,5 @@
 import { supabase } from '../../lib/supabase';
-import type { Room, RoomWithMembers, RoomListItem, CreateRoomInput, DiceLog, DiceLogInsert, RoomNpcEntry, PrivateGroupWithMembers, CreatePrivateGroupInput } from './roomTypes';
+import type { Room, RoomWithMembers, RoomListItem, CreateRoomInput, DiceLog, DiceLogInsert, RoomNpcEntry, PrivateGroupWithMembers, CreatePrivateGroupInput, RoomBackground } from './roomTypes';
 import type { CharacterState } from '../../(single)/page';
 import { DEFAULT_RULES, rulesToInsert, revealedFromMember } from './roomRules';
 import type { CardSection } from './roomRules';
@@ -728,4 +728,83 @@ export const sendPrivateMessage = async (params: {
     level: text,
     payload: { group_id: params.groupId, group_name: params.groupName },
   });
+};
+
+// ---------- 房间背景图库（KP 导入，最多 20 张） ----------
+
+// 图库列表（按导入时间正序，便于“换一张”按固定顺序循环）
+export const getRoomBackgrounds = async (roomId: string): Promise<RoomBackground[]> => {
+  const { data, error } = await supabase
+    .from('room_backgrounds')
+    .select('*')
+    .eq('room_id', roomId)
+    .order('created_at', { ascending: true });
+
+  if (error) throw new Error(error.message);
+  return (data || []) as RoomBackground[];
+};
+
+// 新增一张背景图记录（图片本体已上传到 Storage）
+export const addRoomBackground = async (params: {
+  roomId: string;
+  userId: string;
+  url: string;
+  storagePath: string;
+  note?: string | null;
+}): Promise<RoomBackground> => {
+  const { data, error } = await supabase
+    .from('room_backgrounds')
+    .insert({
+      room_id: params.roomId,
+      url: params.url,
+      storage_path: params.storagePath,
+      note: params.note ?? null,
+      created_by: params.userId,
+    })
+    .select()
+    .single();
+
+  if (error) throw new Error(error.message);
+  if (!data) throw new Error('背景图导入失败');
+  return data as RoomBackground;
+};
+
+// 修改背景图备注
+export const updateRoomBackgroundNote = async (id: string, note: string | null): Promise<void> => {
+  const { data, error } = await supabase
+    .from('room_backgrounds')
+    .update({ note })
+    .eq('id', id)
+    .select();
+
+  if (error) throw new Error(error.message);
+  if (!data || data.length === 0) throw new Error('备注更新失败，可能没有操作权限');
+};
+
+// 删除背景图记录（Storage 对象由调用方一并清理）
+export const deleteRoomBackground = async (id: string): Promise<void> => {
+  const { data, error } = await supabase
+    .from('room_backgrounds')
+    .delete()
+    .eq('id', id)
+    .select();
+
+  if (error) throw new Error(error.message);
+  if (!data || data.length === 0) throw new Error('删除失败，可能没有操作权限');
+};
+
+// KP 设置房间当前背景（url=null 表示移除背景）
+export const setRoomBackground = async (
+  roomId: string,
+  url: string | null,
+  note: string | null
+): Promise<void> => {
+  const { data, error } = await supabase
+    .from('rooms')
+    .update({ background_url: url, background_note: note, updated_at: new Date().toISOString() })
+    .eq('id', roomId)
+    .select();
+
+  if (error) throw new Error(error.message);
+  if (!data || data.length === 0) throw new Error('背景切换失败，可能没有操作权限');
 };

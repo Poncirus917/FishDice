@@ -17,6 +17,9 @@ export interface Room {
   enable_burn_luck: boolean;
   crit_threshold: number;
   fumble_threshold: number;
+  // KP 设置的房间背景图（中央区域显示；null = 未设置）
+  background_url: string | null;
+  background_note: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -112,6 +115,11 @@ export interface PerformCheckInput {
   characterId?: string | null;
   charName?: string | null;
   hidden?: boolean;
+  // 密聊群内掷骰：非空时仅该群成员与 KP 可见
+  groupId?: string | null;
+  groupName?: string | null;
+  // 附加数据（如应答 KP 检定请求时携带 request_id）
+  payload?: Record<string, any> | null;
 }
 
 // 发起一次自由掷骰（NdM 多组骰子 + 加值）的入参
@@ -121,6 +129,9 @@ export interface PerformCustomInput {
   bonus?: number;
   characterId?: string | null;
   charName?: string | null;
+  // 密聊群内掷骰：非空时仅该群成员与 KP 可见
+  groupId?: string | null;
+  groupName?: string | null;
 }
 
 // room_npcs 一行：房间内的一个 NPC/怪物实例
@@ -160,4 +171,16 @@ export interface CreatePrivateGroupInput {
   createdBy: string;
   name?: string;
   memberUserIds: string[];
+}
+
+// room_backgrounds 一行：KP 导入的一张房间背景图
+export interface RoomBackground {
+  id: string;
+  room_id: string;
+  url: string;
+  // Supabase Storage 中的对象路径（删除图片时用）
+  storage_path: string;
+  note: string | null;
+  created_by: string;
+  created_at: string;
 }

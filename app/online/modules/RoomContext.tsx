@@ -18,6 +18,8 @@ interface RoomContextType {
   pauseRoom: () => Promise<void>;
   resumeRoomByKP: () => Promise<void>;
   renameRoom: (name: string) => Promise<void>;
+  // KP 切换房间背景图（写入 rooms 表并本地同步，PL 端实时订阅 rooms 变更）
+  setRoomBackground: (roomId: string, url: string | null, note: string | null) => Promise<void>;
   deleteRoom: () => Promise<void>;
   loadRoom: (roomId: string) => Promise<void>;
   clearRoom: () => void;
@@ -31,6 +33,14 @@ interface RoomContextType {
   diceLogs: DiceLog[];
   performCheck: (input: PerformCheckInput) => Promise<void>;
   performCustomRoll: (input: PerformCustomInput) => Promise<void>;
+  // KP 发起检定请求（指定若干玩家各掷一次），PL 端实时收到后各自掷骰应答
+  sendCheckRequest: (input: {
+    label: string;
+    targetUserIds: string[];
+    charName?: string | null;
+    groupId?: string | null;
+    groupName?: string | null;
+  }) => Promise<void>;
   // 向当前房间频道广播任意事件（KP 操作通知等；不受 RLS 限制）
   broadcastToRoom: (event: string, payload?: Record<string, any>) => Promise<void>;
 }
@@ -161,6 +171,23 @@ export function RoomProvider({ userId, children }: { userId: string; children: R
       window.dispatchEvent(new CustomEvent('room-npcs-changed'));
     });
 
+    // 监听广播事件：check_request_cancelled（KP 取消检定请求）
+    channel.on('broadcast', { event: 'check_request_cancelled' }, async (payload) => {
+      console.log('[setupRoomChannel] 收到 check_request_cancelled 广播:', payload.payload);
+      window.dispatchEvent(new CustomEvent('check-request-cancelled', { detail: payload.payload }));
+    });
+
+    // 监听 rooms UPDATE（KP 切换背景图 / 改名等）：直接合并到当前房间，PL 端无需刷新即可同步
+    channel.on(
+      'postgres_changes',
+      { event: 'UPDATE', schema: 'public', table: 'rooms', filter: `id=eq.${roomId}` },
+      (payload) => {
+        const row = (payload as any).new as Partial<RoomWithMembers> | null;
+        if (!row) return;
+        setCurrentRoom(prev => (prev && prev.id === roomId ? { ...prev, ...row } : prev));
+      }
+    );
+
     // 监听广播事件：room_update
     channel.on('broadcast', { event: 'room_update' }, async (payload) => {
       console.log('[setupRoomChannel] 收到 room_update 广播:', payload.payload);
@@ -237,12 +264,17 @@ export function RoomProvider({ userId, children }: { userId: string; children: R
   }, []);
 
   // 发起一次 1D100 检定：掷骰者客户端掷骰 → 写 dice_logs → 实时推送给全房。
-  // 阶段2使用默认房规（大成功 ≤3 / 大失败 ≥98）；阶段3房规字段就位后改读房间配置。
+  // 检定使用房间创建时配置的房规（大成功 ≤crit_threshold / 大失败 ≥fumble_threshold），
+  // 老房间字段缺失时回退默认 3 / 98
   const performCheck = useCallback(async (input: PerformCheckInput): Promise<void> => {
     const room = currentRoomRef.current;
     if (!room) throw new Error('当前不在房间中');
 
-    const result = cocCheck(input.target);
+    const result = cocCheck(
+      input.target,
+      room.crit_threshold ?? 3,
+      room.fumble_threshold ?? 98,
+    );
     await roomService.insertDiceLog({
       room_id: room.id,
       user_id: userId,
@@ -253,8 +285,45 @@ export function RoomProvider({ userId, children }: { userId: string; children: R
       roll: result.roll,
       target: input.target,
       level: result.level,
+      // 密聊群内掷骰：payload 携带群 id，RLS 据此限制可见范围（仅群成员与 KP）
+      payload: {
+        ...(input.payload ?? {}),
+        ...(input.groupId ? { group_id: input.groupId, group_name: input.groupName ?? null } : {}),
+      },
     });
     // 不需要本地追加：自己的 INSERT 也会通过 Postgres Changes 回推，保持单一数据源
+  }, [userId]);
+
+  // KP 发起检定请求：写一条 msg_type='request' 日志（payload 携带 request_id 与目标玩家名单），
+  // PL 端实时收到后各自用角色卡数值掷骰应答，应答行携带同一 request_id，各端据此聚合进度。
+  // 是否通过、通过后如何处理由 KP 自行判断，这里不做任何通过条件设定。
+  const sendCheckRequest = useCallback(async (input: {
+    label: string;
+    targetUserIds: string[];
+    charName?: string | null;
+    groupId?: string | null;
+    groupName?: string | null;
+  }): Promise<void> => {
+    const room = currentRoomRef.current;
+    if (!room) throw new Error('当前不在房间中');
+    const label = input.label.trim();
+    if (!label) throw new Error('请填写检定项目');
+    if (input.targetUserIds.length === 0) throw new Error('请至少选择一名目标玩家');
+    await roomService.insertDiceLog({
+      room_id: room.id,
+      user_id: userId,
+      char_name: input.charName ?? '守秘人',
+      msg_type: 'request',
+      label,
+      roll: null,
+      target: null,
+      level: `已向 ${input.targetUserIds.length} 名玩家发起`,
+      payload: {
+        request_id: crypto.randomUUID(),
+        user_ids: input.targetUserIds,
+        ...(input.groupId ? { group_id: input.groupId, group_name: input.groupName ?? null } : {}),
+      },
+    });
   }, [userId]);
 
   // 发起一次自由掷骰：本地按 NdM(+加值) 结算 → 写 dice_logs（msg_type='custom'）→ 实时推送给全房。
@@ -284,6 +353,9 @@ export function RoomProvider({ userId, children }: { userId: string; children: R
       roll: result.total,
       target: null,
       level: detail,
+      payload: input.groupId
+        ? { group_id: input.groupId, group_name: input.groupName ?? null }
+        : null,
     });
   }, [userId]);
 
@@ -510,6 +582,18 @@ export function RoomProvider({ userId, children }: { userId: string; children: R
     }
   }, [broadcastRoomUpdate]);
 
+  // KP 切换房间背景图：更新 rooms 表后本地即时生效；PL 端通过 rooms 实时订阅同步
+  const setRoomBackground = useCallback(async (
+    roomId: string,
+    url: string | null,
+    note: string | null
+  ): Promise<void> => {
+    await roomService.setRoomBackground(roomId, url, note);
+    setCurrentRoom(prev => (
+      prev && prev.id === roomId ? { ...prev, background_url: url, background_note: note } : prev
+    ));
+  }, []);
+
   const deleteRoom = useCallback(async (): Promise<void> => {
     if (!currentRoom) return;
     setLoading(true);
@@ -632,6 +716,7 @@ export function RoomProvider({ userId, children }: { userId: string; children: R
     pauseRoom,
     resumeRoomByKP,
     renameRoom,
+    setRoomBackground,
     deleteRoom,
     loadRoom,
     clearRoom,
@@ -643,6 +728,7 @@ export function RoomProvider({ userId, children }: { userId: string; children: R
     diceLogs,
     performCheck,
     performCustomRoll,
+    sendCheckRequest,
     broadcastToRoom,
   };
 
